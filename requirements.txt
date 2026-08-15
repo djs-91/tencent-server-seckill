@@ -1,0 +1,3 @@
+playwright>=1.40
+colorama>=0.4.6
+requests>=2.25
