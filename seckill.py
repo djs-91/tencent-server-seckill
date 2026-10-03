@@ -17,6 +17,7 @@
 import asyncio
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime, timedelta
@@ -25,7 +26,7 @@ from pathlib import Path
 try:
     from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 except ImportError:
-    print("pip3 install playwright && playwright install chromium")
+    print("pip3 install playwright")
     sys.exit(1)
 
 # ============================================================
@@ -97,7 +98,80 @@ WARMUP_SECONDS = 10
 STATE_PATH = Path(__file__).parent / ".state.json"
 LOG_PATH = Path(__file__).parent / "seckill.log"
 
-# 捕获前端真实请求用的 x-csrf-token（前端动态生成，只能 hook fetch/XHR 获取）
+# 启动顺序：先用本机的，都没装就回落到 playwright 下载的 chromium
+BROWSER_CHANNELS = ["chrome", "msedge", None]
+
+BROWSER_LABEL = {
+    "chrome": "本机 Chrome",
+    "msedge": "本机 Edge",
+    None: "playwright chromium",
+}
+
+BROWSER_PATHS = {
+    "win": {
+        "chrome": [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
+        ],
+        "msedge": [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe",
+        ],
+    },
+    "darwin": {
+        "chrome": ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
+        "msedge": ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"],
+    },
+    "linux": {
+        "chrome": ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"],
+        "msedge": ["/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable"],
+    },
+}
+
+LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+
+
+def detect_browser():
+    """看本机装了哪些浏览器，返回第一个找到的 channel。没找到返回 None。"""
+    plat = "win" if sys.platform.startswith("win") else (
+        "darwin" if sys.platform == "darwin" else "linux")
+    paths = BROWSER_PATHS.get(plat, {})
+
+    for channel in BROWSER_CHANNELS:
+        if channel is None:
+            continue
+        for p in paths.get(channel, []):
+            if Path(os.path.expandvars(p)).exists():
+                return channel
+
+    return None
+
+
+async def launch_browser(pw, headless=True, extra_args=None):
+    """按 BROWSER_CHANNELS 顺序试，谁能起就用谁。"""
+    args = LAUNCH_ARGS + list(extra_args or [])
+    last = None
+
+    for channel in BROWSER_CHANNELS:
+        kwargs = {"headless": headless, "args": args}
+        if channel:
+            kwargs["channel"] = channel
+        try:
+            browser = await pw.chromium.launch(**kwargs)
+            log(f"使用浏览器: {BROWSER_LABEL[channel]}")
+            return browser
+        except Exception as e:
+            last = e
+            if channel is None:
+                log(f"启动失败: {e}")
+                log("没装本机 Chrome/Edge 的话，执行 python -m playwright install chromium")
+
+    raise RuntimeError(f"没有可用的浏览器: {last}")
+
+
+# 前端的 x-csrf-token 是动态生成的，得 hook 住 fetch/XHR 才能拿到
 CSRF_HOOK_JS = """
 window.__latestCsrf = null;
 const _fetch = window.fetch;
@@ -123,8 +197,13 @@ XMLHttpRequest.prototype.setRequestHeader = function(k, v) {
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{ts}] {msg}")
-    with open(LOG_PATH, "a") as f:
-        f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+    try:
+        # 中文 Windows 默认 cp936，编不了 emoji，不指定 encoding 会 UnicodeEncodeError
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+    except UnicodeEncodeError:
+        with open(LOG_PATH, "a", encoding="utf-8", errors="replace") as f:
+            f.write(f"[{datetime.now().isoformat()}] {msg}\n")
 
 
 async def sync_time(page):
@@ -172,7 +251,7 @@ async def sync_time(page):
     if offsets:
         offsets.sort()
         offset = int(offsets[len(offsets) // 2])
-        log(f"⏰ 服务器时间偏移: {offset:+d}ms (Date头对时 ×{len(offsets)}中位数 {offsets})")
+        log(f"服务器时间偏移: {offset:+d}ms (Date头对时 ×{len(offsets)}中位数 {offsets})")
         return offset
 
     # 回退：页面 nowTime（静态值，含页面加载延迟，精度较差）
@@ -186,7 +265,7 @@ async def sync_time(page):
             return 0;
         }
     """)
-    log(f"⏰ 服务器时间偏移: {offset:+d}ms (nowTime回退)")
+    log(f"服务器时间偏移: {offset:+d}ms (nowTime回退)")
     return offset
 
 
@@ -224,7 +303,7 @@ async def api_do_goods(page, goods, attempt):
 
     if code == 0:
         deal = result.get("data", {})
-        log(f"🎉🎉🎉 下单成功！#{attempt}")
+        log(f"下单成功 #{attempt}")
         log(f"   订单号: {deal.get('deal_names', ['?'])[0]}")
         log(f"   大单号: {deal.get('big_deal_no', '?')}")
         return True
@@ -236,14 +315,14 @@ async def api_do_goods(page, goods, attempt):
 
 async def warmup(page, goods):
     """预热连接：提前发一个请求建立TCP/TLS，到点直接用"""
-    log("🔥 预热连接...")
+    log("预热连接...")
     result = await api_do_goods(page, goods, 0)
     log(f"  预热完成 (结果: {'成功' if result else '未到时间，正常'})")
 
 
 async def rapid_purchase(page, goods, duration=DURATION_SEC):
-    """并发疯狂调用API — 批量模式，单次evaluate发多个请求"""
-    log(f"🔥 开始抢购！并发={CONCURRENCY}，间隔={ROUND_INTERVAL_MS}ms，持续={duration}s")
+    """并发调 API，每次 evaluate 发一批请求"""
+    log(f"开始抢购：并发={CONCURRENCY}，间隔={ROUND_INTERVAL_MS}ms，持续={duration}s")
 
     start = time.monotonic()
     attempt = 0
@@ -290,7 +369,7 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
             code = r.get("code")
             if code == 0:
                 deal = r.get("data", {})
-                log(f"🎉🎉🎉 下单成功！")
+                log("下单成功")
                 log(f"   订单号: {deal.get('deal_names', ['?'])[0]}")
                 log(f"   大单号: {deal.get('big_deal_no', '?')}")
                 success = True
@@ -306,7 +385,7 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
         await asyncio.sleep(ROUND_INTERVAL_MS / 1000)
 
     elapsed = time.monotonic() - start
-    log(f"抢购结束: {attempt} 次请求, {elapsed:.1f}s, {'✅成功' if success else '❌未抢到'}")
+    log(f"抢购结束: {attempt} 次请求, {elapsed:.1f}s, {'成功' if success else '未抢到'}")
     return success
 
 
@@ -323,10 +402,7 @@ def find_nearest_time(offset_ms=0):
 
 async def run(target_time=None, test_mode=False, loop_mode=False):
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch(
-        headless=False,
-        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-    )
+    browser = await launch_browser(pw, headless=False)
 
     if STATE_PATH.exists():
         ctx = await browser.new_context(
@@ -363,7 +439,7 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
 
         # 保存登录状态
         await ctx.storage_state(path=str(STATE_PATH))
-        log("✅ 登录状态已保存")
+        log("登录状态已保存")
 
         # 同步时间
         offset_ms = await sync_time(page)
@@ -377,15 +453,15 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
                 break
             await asyncio.sleep(0.2)
         else:
-            log("⚠️ 未捕获到 CSRF token，请求可能失败")
+            log("未捕获到 CSRF token，请求可能失败")
 
         if test_mode:
             log("测试模式: 直接调用 do-goods")
             success = await rapid_purchase(page, goods, duration=5)
             if success:
-                log("🎉 测试成功！API格式正确")
+                log("测试成功，API 格式正确")
             else:
-                log("测试完成。查看返回的code判断是否格式正确。")
+                log("测试完成。查看返回的 code 判断格式是否正确。")
             return
 
         # 等待抢购时间
@@ -397,9 +473,9 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
 
         now = datetime.fromtimestamp((int(time.time() * 1000) + offset_ms) / 1000)
         wait_sec = (target_dt - now).total_seconds()
-        log(f"⏰ 目标: {target_dt.strftime('%Y-%m-%d %H:%M:%S')} (服务器时间)")
-        log(f"⏳ 等待 {wait_sec:.0f}s ({wait_sec/60:.1f}min)")
-        log(f"⚡ 提前量: {abs(ADVANCE_MS)}ms (会在目标时间前{abs(ADVANCE_MS)/1000:.1f}秒开始)")
+        log(f"目标: {target_dt.strftime('%Y-%m-%d %H:%M:%S')} (服务器时间)")
+        log(f"等待 {wait_sec:.0f}s ({wait_sec/60:.1f}min)")
+        log(f"提前量 {abs(ADVANCE_MS)}ms，会在目标时间前 {abs(ADVANCE_MS)/1000:.1f} 秒开始")
 
         warmed_up = False
         resynced = False
@@ -409,23 +485,22 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
 
             # 剩余 3 分钟时重新对时一次（Date 头实时对时，安全，修正长时间等待的微小漂移）
             if remaining <= 180 and not resynced:
-                log("🔄 剩余3分钟，重新对时...")
+                log("剩余3分钟，重新对时...")
                 offset_ms = await sync_time(page)
                 resynced = True
                 continue  # 用新偏移重算 remaining
 
-            # ADVANCE_MS 提前量: 负数=提前开始（remaining 为正=还没到点，剩余秒数）
-            # 提前3秒 = remaining <= 3.0s 时触发（即 -ADVANCE_MS = 3000ms）
+            # remaining 是正数表示还没到点，所以是 <= 3.0s 时开始（即提前3秒）
             if remaining * 1000 <= -ADVANCE_MS:
-                log(f"🚀 提前 {abs(ADVANCE_MS)}ms 开始！")
+                log(f"提前 {abs(ADVANCE_MS)}ms 开始")
                 break
 
             if remaining <= 10:
-                log(f"⚡ {remaining:.1f}s")
+                log(f"{remaining:.1f}s")
             elif int(remaining) % 60 == 0:
                 log(f"  还剩 {remaining/60:.0f}min")
 
-            # 预热：提前10秒发一个请求建立连接
+            # 提前10秒发一个请求，把连接建好
             if remaining <= WARMUP_SECONDS and not warmed_up:
                 await warmup(page, goods)
                 warmed_up = True
@@ -436,8 +511,7 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
         success = await rapid_purchase(page, goods)
 
         if success:
-            log("🎉 抢购成功！请在浏览器中完成支付。")
-            # 等用户支付
+            log("抢购成功，请在浏览器中完成支付")
             await asyncio.sleep(600)
         else:
             log("未抢到。")
@@ -445,7 +519,7 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
     except KeyboardInterrupt:
         log("用户中断")
     except Exception as e:
-        log(f"❌ 错误: {e}")
+        log(f"错误: {e}")
         import traceback
         traceback.print_exc()
     finally:
