@@ -4,11 +4,8 @@
 ============================================
 活动: 上云精选·限时秒杀（轻量应用服务器 38元/年）
 网址: https://cloud.tencent.com/act/pro/featured-202607#MS
-功能:
-  1. 选择服务器地域（上海/北京/广州）
-  2. 扫码登录（弹窗扫码，自动检测，登录态可复用）
-  3. 一键抢购（headless 无窗口，心跳监测浏览器存活）
-  4. 抢到后大字 🎉 提示
+
+菜单里选地域、扫码登录、开抢。登录态存在 .state.json，下次直接复用。
 
 免责声明: 仅供个人学习使用；自动化抢购可能违反活动规则，
 可能致账号限流/受限，风险自担；请勿高频滥用。
@@ -74,37 +71,76 @@ def bark_push(title, body):
     try:
         import requests
         requests.post(f"https://api.day.app/{key}/{title}/{body}", timeout=5)
-        log("📱 Bark 推送已发送")
+        log("Bark 推送已发送")
     except Exception as e:
-        log(f"⚠️ Bark 推送失败: {e}")
+        log(f"Bark 推送失败: {e}")
 
 
 # ---------- 登录 ----------
+_NOT_LOGGED_CODES = {"NOT-LOGINED", "NOT_LOGINED", "NOTLOGINED", "ERROR", "FAIL", "UNAUTHORIZED"}
+
+
+def _login_state(r):
+    """判断 get-vip-info 的返回，'ok' / 'not-logged' / 'unknown'。
+
+    不能只看 code != 'NOT-LOGINED'：请求失败时前端 fetch 会被 catch 成
+    {code: -1}，那不等于 NOT-LOGINED，判成"登录成功"就会误报。
+    """
+    if not isinstance(r, dict) or "code" not in r:
+        return "unknown"
+    code = r["code"]
+    if isinstance(code, bool):
+        return "unknown"
+    if isinstance(code, (int, float)):
+        return "not-logged" if code < 0 else "ok"
+    text = str(code).strip().upper()
+    if text in _NOT_LOGGED_CODES:
+        return "not-logged"
+    return "ok" if text else "unknown"
+
+
 async def _check_login(page):
-    """无害验证：get-vip-info 查询接口，绝不产生订单"""
+    """无害验证：get-vip-info 查询接口，绝不产生订单。返回 (logged, r)"""
     r = await page.evaluate("""
         (url) => fetch(url, {method:'POST',
             headers:{'Content-Type':'application/json','x-csrf-token':window.__latestCsrf||''},
-            credentials:'include', body:'{}'}).then(r=>r.json()).catch(e=>({code:-1,msg:e.message}))
+            credentials:'include', body:'{}'})
+            .then(r => r.json())
+            .catch(e => ({__err: String(e)}))
     """, VIP_URL)
-    return r.get("code") != "NOT-LOGINED", r
+    return _login_state(r) == "ok", r
+
+
+async def _wait_csrf(page, tries=50):
+    """等 CSRF hook 抓到 token。抓不到就返回 False，别拿空 token 去请求。"""
+    for _ in range(tries):
+        if await page.evaluate("() => !!window.__latestCsrf"):
+            return True
+        await asyncio.sleep(0.2)
+    return False
+
+
+async def _save_state(ctx):
+    try:
+        await ctx.storage_state(path=str(STATE_PATH))
+        return True
+    except Exception as e:
+        log(f"保存登录态失败: {e}")
+        return False
 
 
 async def do_login():
-    """弹出浏览器扫码 → 自动检测登录 → 保存状态"""
+    """弹浏览器扫码，检测到登录后存 cookie。"""
     c("=" * 56, Fore.YELLOW)
     c("扫码登录", Fore.YELLOW)
     c("=" * 56, Fore.YELLOW)
-    c("浏览器即将弹出（仅登录用，登录成功自动关闭）", Fore.CYAN)
+    c("浏览器即将弹出（仅登录用）", Fore.CYAN)
     c("请在弹出窗口里：点右上角【登录】→ 微信扫码", Fore.CYAN)
     c("（本机已保存过登录态可跳过本步骤）", Fore.WHITE)
 
     from playwright.async_api import async_playwright
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch(
-        headless=False,
-        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-    )
+    browser = await sf.launch_browser(pw, headless=False)
     ctx = await browser.new_context(viewport={"width": 1400, "height": 900}, user_agent=UA)
     await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
     await ctx.add_init_script(sf.CSRF_HOOK_JS)
@@ -114,10 +150,8 @@ async def do_login():
     log("打开活动页...")
     await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
     await asyncio.sleep(3)
-    for _ in range(25):
-        if await page.evaluate("() => !!window.__latestCsrf"):
-            break
-        await asyncio.sleep(0.2)
+    if not await _wait_csrf(page):
+        log("未捕获到 CSRF token，登录检测可能不准确")
 
     log("请扫码... (10分钟超时)")
     deadline = asyncio.get_event_loop().time() + 600
@@ -131,12 +165,40 @@ async def do_login():
                 break
         except Exception as e:
             log(f"检测异常: {e}")
+
     if ok:
-        await ctx.storage_state(path=str(STATE_PATH))
-        c("✅ 登录成功，登录态已保存！", Fore.GREEN)
-        log("✅ 登录成功（get-vip-info 验证通过）")
+        # 等一下再存：cookie 是扫码后服务端才下发的，立刻存容易存到不完整的一份
+        await asyncio.sleep(1.5)
+        if not await _save_state(ctx):
+            ok = False
+        else:
+            # 用存下来的这份 state 重新开一次，能过才算真的存对了
+            try:
+                vctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
+                await vctx.add_init_script(sf.CSRF_HOOK_JS)
+                vpage = await vctx.new_page()
+                await vpage.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(2)
+                await _wait_csrf(vpage, tries=25)
+                re_ok, _ = await _check_login(vpage)
+                await vctx.close()
+                if not re_ok:
+                    c("登录态复验没过，可能是 CSRF token 没同步，请重试", Fore.YELLOW)
+                    ok = False
+                else:
+                    c("登录成功，登录态已保存", Fore.GREEN)
+                    log("get-vip-info 验证通过，state 复验通过")
+            except Exception as e:
+                c(f"复验出错: {e}（已保存的登录态不受影响）", Fore.YELLOW)
     else:
-        c("❌ 10分钟超时未登录", Fore.RED)
+        c("10分钟超时未登录", Fore.RED)
+
+    if ok:
+        c("浏览器先留着，你可以自己看一眼登录状态，按回车关闭", Fore.CYAN)
+        try:
+            input()
+        except (EOFError, KeyboardInterrupt):
+            pass
     await browser.close()
     await pw.stop()
     return ok
@@ -144,21 +206,49 @@ async def do_login():
 
 # ---------- 抢购 ----------
 async def ensure_login():
-    """确保有登录态；没有则引导扫码登录"""
-    if STATE_PATH.exists():
+    """没登录态就引导扫码。文件在不代表 cookie 还有效，所以要真验一次。"""
+    if not STATE_PATH.exists():
+        c("未找到登录态，首次使用需要先扫码登录", Fore.RED)
+        y = input("  现在扫码登录？(y/n): ").strip().lower()
+        if y == "y":
+            await do_login()
+        if STATE_PATH.exists():
+            c("已保存登录态，用 [5] 测试连通 可以确认是否有效", Fore.YELLOW)
+            return True
+        c("  未登录，操作已取消", Fore.RED)
+        return False
+
+    try:
+        from playwright.async_api import async_playwright
+        pw = await async_playwright().start()
+        browser = await sf.launch_browser(pw, headless=True)
+        ctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
+        await ctx.add_init_script(sf.CSRF_HOOK_JS)
+        page = await ctx.new_page()
+        await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+        await _wait_csrf(page, tries=25)
+        logged, _ = await _check_login(page)
+        await browser.close()
+        await pw.stop()
+    except Exception as e:
+        log(f"登录态校验异常，按有效处理: {e}")
         return True
-    c("❌ 未找到登录态（首次使用需先扫码登录）", Fore.RED)
-    y = input("  现在扫码登录？(y/n): ").strip().lower()
+
+    if logged:
+        log("登录态有效")
+        return True
+
+    c("保存的登录态已失效", Fore.RED)
+    y = input("  现在重新扫码登录？(y/n): ").strip().lower()
     if y == "y":
-        await do_login()
-    if STATE_PATH.exists():
-        return True
+        return await do_login()
     c("  未登录，操作已取消", Fore.RED)
     return False
 
 
 async def run_grab(region_id, target_time=None):
-    """headless 抢购 + 心跳监测 + 反馈"""
+    """headless 抢购，顺便用心跳显示浏览器还活着没"""
     if not await ensure_login():
         return False
     goods = {**sf.FLASH_SALE, "goods_param": {**sf.FLASH_SALE["goods_param"], "regionId": region_id}}
@@ -168,12 +258,9 @@ async def run_grab(region_id, target_time=None):
     c("=" * 56, Fore.YELLOW)
 
     pw = await sf.async_playwright().start()
-    browser = await pw.chromium.launch(
-        headless=True,
-        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-    )
+    browser = await sf.launch_browser(pw, headless=True)
 
-    # 心跳监测线程（控制台）
+    # 心跳：跑抢购要等很久，给个提示浏览器还活着
     stop_hb = {"v": False}
     def heartbeat():
         while not stop_hb["v"]:
@@ -181,7 +268,7 @@ async def run_grab(region_id, target_time=None):
                 alive = browser.is_connected()
             except Exception:
                 alive = False
-            sys.stdout.write(f"\r🖥️ 浏览器状态: {'运行中' if alive else '❌ 已关闭'} | 按 Ctrl+C 停止    ")
+            sys.stdout.write(f"\r浏览器状态: {'运行中' if alive else '已关闭'} | Ctrl+C 停止    ")
             sys.stdout.flush()
             time.sleep(5)
     import threading
@@ -199,35 +286,29 @@ async def run_grab(region_id, target_time=None):
         await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(3)
 
-        # 登录检查（无害）
         try:
             logged, r = await _check_login(page)
             if not logged:
-                c("❌ 登录态无效（NOT-LOGINED）", Fore.RED)
+                c(f"登录态无效（{r.get('code') or r.get('__err')}）", Fore.RED)
                 y = input("  是否现在重新扫码登录？(y/n): ").strip().lower()
                 if y == "y":
                     if await do_login():
-                        c("  ✅ 重新登录成功，请回到菜单重新选择场次开始抢购。", Fore.GREEN)
+                        c("  重新登录成功，请回到菜单重新选择场次开始抢购。", Fore.GREEN)
                     else:
-                        c("  ❌ 重新登录失败", Fore.RED)
+                        c("  重新登录失败", Fore.RED)
                 return False
-            log("✅ 登录态有效")
+            log("登录态有效")
         except Exception as e:
-            c(f"❌ 登录检查失败: {e}", Fore.RED)
+            c(f"登录检查失败: {e}", Fore.RED)
             return False
 
-        await ctx.storage_state(path=str(STATE_PATH))
+        await _save_state(ctx)
 
-        # 等 CSRF token
-        for _ in range(50):
-            if await page.evaluate("() => !!window.__latestCsrf"):
-                break
-            await asyncio.sleep(0.2)
+        if not await _wait_csrf(page):
+            c("未捕获到 CSRF token，请求可能被拒绝", Fore.YELLOW)
 
-        # 对时
         offset_ms = await sf.sync_time(page)
 
-        # 目标时间
         if target_time:
             now = datetime.fromtimestamp((int(time.time() * 1000) + offset_ms) / 1000)
             target_dt = datetime.strptime(f"{now.date()} {target_time}", "%Y-%m-%d %H:%M")
@@ -236,31 +317,31 @@ async def run_grab(region_id, target_time=None):
 
         now = datetime.fromtimestamp((int(time.time() * 1000) + offset_ms) / 1000)
         wait_sec = (target_dt - now).total_seconds()
-        log(f"⏰ 目标: {target_dt.strftime('%Y-%m-%d %H:%M:%S')} (服务器时间)")
-        log(f"⏳ 等待 {wait_sec:.0f}s ({wait_sec/60:.1f}min)")
+        log(f"目标: {target_dt.strftime('%Y-%m-%d %H:%M:%S')} (服务器时间)")
+        log(f"等待 {wait_sec:.0f}s ({wait_sec/60:.1f}min)")
 
-        # 等待循环（含 3 分钟重对时 + 心跳）
         warmed_up = False
         resynced = False
         while True:
             if not browser.is_connected():
-                c("\n❌ 浏览器已被关闭！程序中止。", Fore.RED)
+                c("\n浏览器已被关闭，程序中止。", Fore.RED)
                 return False
             now_ms = int(time.time() * 1000) + offset_ms
             remaining = (target_dt.timestamp() * 1000 - now_ms) / 1000
 
+            # 剩余 3 分钟再对一次时，修正长时间等待带来的漂移
             if remaining <= 180 and not resynced:
-                log("🔄 剩余3分钟，重新对时...")
+                log("剩余3分钟，重新对时...")
                 offset_ms = await sf.sync_time(page)
                 resynced = True
                 continue
 
             if remaining * 1000 <= -sf.ADVANCE_MS:
-                log(f"🚀 提前 {abs(sf.ADVANCE_MS)}ms 开始！")
+                log(f"提前 {abs(sf.ADVANCE_MS)}ms 开始")
                 break
 
             if remaining <= 10:
-                log(f"⚡ {remaining:.1f}s")
+                log(f"{remaining:.1f}s")
             elif int(remaining) % 60 == 0:
                 log(f"  还剩 {remaining/60:.0f}min")
 
@@ -270,28 +351,24 @@ async def run_grab(region_id, target_time=None):
 
             await asyncio.sleep(0.05 if remaining <= 5 else 1)
 
-        # 抢购
         success = await sf.rapid_purchase(page, goods)
         stop_hb["v"] = True
         if success:
-            c("\n" + "🎉" * 20, Fore.GREEN)
-            c("🎉🎉🎉 抢购成功！请在腾讯云控制台付款（1小时内）！", Fore.GREEN)
-            c("🎉" * 20, Fore.GREEN)
+            c("\n" + "=" * 40, Fore.GREEN)
+            c("抢购成功，请在腾讯云控制台付款（1小时内）", Fore.GREEN)
+            c("=" * 40, Fore.GREEN)
         else:
-            c("\n❌ 未抢到，本场结束。", Fore.RED)
+            c("\n未抢到，本场结束。", Fore.RED)
         return success
     except KeyboardInterrupt:
         c("\n用户中断", Fore.YELLOW)
     except Exception as e:
-        c(f"\n❌ 错误: {e}", Fore.RED)
+        c(f"\n错误: {e}", Fore.RED)
         import traceback
         traceback.print_exc()
     finally:
         stop_hb["v"] = True
-        try:
-            await ctx.storage_state(path=str(STATE_PATH))
-        except Exception:
-            pass
+        await _save_state(ctx)
         try:
             await browser.close()
         except Exception:
@@ -321,34 +398,37 @@ def show_menu():
     c("  [6] 测试下单（真实下单，慎用！）", Fore.RED)
     c("  [0] 退出", Fore.WHITE)
     c("-" * 56, Fore.WHITE)
-    c("⚠️ 免责声明: 本工具仅供个人学习使用；自动化抢购可能违反", Fore.YELLOW)
-    c("   活动规则，可能导致账号限流/受限，风险自担；请勿高频滥用。", Fore.YELLOW)
+    c("免责声明: 本工具仅供个人学习使用；自动化抢购可能违反", Fore.YELLOW)
+    c("  活动规则，可能导致账号限流/受限，风险自担；请勿高频滥用。", Fore.YELLOW)
     c("=" * 56, Fore.YELLOW)
 
 
 async def test_connect(region_id):
-    """测试：headless 打开页面 + 验证登录（无害，不抢购）"""
-    if not await ensure_login():
-        return False
+    """headless 打开页面验一下登录，不抢购"""
+    if not STATE_PATH.exists():
+        if not await ensure_login():
+            return False
     from playwright.async_api import async_playwright
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
+    browser = await sf.launch_browser(pw, headless=True)
     ctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
     await ctx.add_init_script(sf.CSRF_HOOK_JS)
     page = await ctx.new_page()
     await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
     await asyncio.sleep(3)
-    for _ in range(25):
-        if await page.evaluate("() => !!window.__latestCsrf"):
-            break
-        await asyncio.sleep(0.2)
+    await _wait_csrf(page, tries=25)
     logged, r = await _check_login(page)
-    c(f"  登录态: {'✅ 有效' if logged else '❌ 无效 (' + str(r.get('code')) + ')'}", Fore.GREEN if logged else Fore.RED)
+    label = {
+        "ok": "有效",
+        "not-logged": f"无效 ({r.get('code')})",
+        "unknown": f"未知 ({r.get('code') or r.get('__err')})",
+    }[_login_state(r)]
+    c(f"  登录态: {label}", Fore.GREEN if logged else Fore.RED)
     c(f"  地域: {REGIONS.get(region_id)} (regionId={region_id})", Fore.CYAN)
     if logged:
         c("  测试通过，参数就绪，可以开抢。", Fore.GREEN)
     else:
-        c("  ❌ 登录态无效！需要重新扫码登录。", Fore.RED)
+        c("  登录态无效，需要重新扫码登录。", Fore.RED)
     await browser.close()
     await pw.stop()
     if not logged:
@@ -359,13 +439,13 @@ async def test_connect(region_id):
 
 
 async def test_order(region_id):
-    """测试下单：用服务器专区商品真实下单（会产生订单，慎用！）"""
+    """测试下单：用服务器专区商品真实下单，会产生订单"""
     if not await ensure_login():
         return
-    c("⚠️" * 20, Fore.RED)
-    c("⚠️ 风险提示：测试下单会【真实创建订单】！", Fore.RED)
-    c("⚠️ 订单不付款会在 1 小时内自动关闭，也可到控制台手动取消", Fore.RED)
-    c("⚠️" * 20, Fore.RED)
+    c("!" * 56, Fore.RED)
+    c("风险提示：测试下单会真实创建订单！", Fore.RED)
+    c("订单不付款会在 1 小时内自动关闭，也可到控制台手动取消", Fore.RED)
+    c("!" * 56, Fore.RED)
     y = input("  确认测试下单？输入 YES 继续: ").strip()
     if y != "YES":
         c("  已取消", Fore.YELLOW)
@@ -373,20 +453,17 @@ async def test_order(region_id):
     goods = {**sf.TEST_GOODS, "goods_param": {**sf.TEST_GOODS["goods_param"], "regionId": region_id}}
     from playwright.async_api import async_playwright
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
+    browser = await sf.launch_browser(pw, headless=True)
     ctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
     await ctx.add_init_script(sf.CSRF_HOOK_JS)
     page = await ctx.new_page()
     page.set_default_timeout(30000)
     await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
     await asyncio.sleep(3)
-    for _ in range(50):
-        if await page.evaluate("() => !!window.__latestCsrf"):
-            break
-        await asyncio.sleep(0.2)
+    await _wait_csrf(page)
     logged, _ = await _check_login(page)
     if not logged:
-        c("  ❌ 登录态无效（NOT-LOGINED）", Fore.RED)
+        c("  登录态无效，需要重新扫码登录。", Fore.RED)
         await browser.close()
         await pw.stop()
         y = input("  是否现在重新扫码登录？(y/n): ").strip().lower()
@@ -396,9 +473,9 @@ async def test_order(region_id):
     c("  开始测试下单（服务器专区商品，持续5秒）...", Fore.CYAN)
     success = await sf.rapid_purchase(page, goods, duration=5)
     if success:
-        c("  🎉 测试下单成功！（记得去控制台取消该订单）", Fore.GREEN)
+        c("  测试下单成功（记得去控制台取消该订单）", Fore.GREEN)
     else:
-        c("  测试完成（未下单成功，可查看上方日志判断原因）", Fore.YELLOW)
+        c("  测试完成（未下单成功，查看上方日志判断原因）", Fore.YELLOW)
     await browser.close()
     await pw.stop()
 
@@ -417,9 +494,9 @@ def main():
             if r in ("4", "8", "1"):
                 cfg["region"] = int(r)
                 save_config(cfg)
-                c(f"  ✅ 地域已设为 {REGIONS[int(r)]}", Fore.GREEN)
+                c(f"  地域已设为 {REGIONS[int(r)]}", Fore.GREEN)
             else:
-                c("  ❌ 无效输入", Fore.RED)
+                c("  无效输入", Fore.RED)
         elif choice == "2":
             asyncio.run(do_login())
         elif choice == "3":
@@ -432,7 +509,7 @@ def main():
             elif t == "2":
                 asyncio.run(run_grab(cfg.get("region", 8), target_time="15:00"))
             else:
-                c("  ❌ 无效输入（请输入 1 或 2）", Fore.RED)
+                c("  无效输入（请输入 1 或 2）", Fore.RED)
         elif choice == "5":
             asyncio.run(test_connect(cfg.get("region", 8)))
         elif choice == "6":
@@ -440,7 +517,7 @@ def main():
         elif choice == "0":
             break
         else:
-            c("  ❌ 无效选项", Fore.RED)
+            c("  无效选项", Fore.RED)
         input("\n按回车继续...")
     c("再见！", Fore.YELLOW)
 
