@@ -78,6 +78,8 @@ def bark_push(title, body):
 
 # ---------- 登录 ----------
 _NOT_LOGGED_CODES = {"NOT-LOGINED", "NOT_LOGINED", "NOTLOGINED", "ERROR", "FAIL", "UNAUTHORIZED"}
+# 只有明确表示成功的 code 才算已登录，其余未识别的一律按未登录处理
+_OK_CODES = {"OK", "SUCCESS", "SUCC"}
 
 
 def _login_state(r):
@@ -89,14 +91,19 @@ def _login_state(r):
     if not isinstance(r, dict) or "code" not in r:
         return "unknown"
     code = r["code"]
-    if isinstance(code, bool):
+    if code is None or isinstance(code, bool):
         return "unknown"
     if isinstance(code, (int, float)):
         return "not-logged" if code < 0 else "ok"
     text = str(code).strip().upper()
+    if not text:
+        return "unknown"
     if text in _NOT_LOGGED_CODES:
         return "not-logged"
-    return "ok" if text else "unknown"
+    # 以前这里把任何不认识的 code 都当成功，CSRF-ERROR 会被误判成"登录成功"
+    if text in _OK_CODES or text.isdigit():
+        return "ok"
+    return "not-logged"
 
 
 async def _check_login(page):
