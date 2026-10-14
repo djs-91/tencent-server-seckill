@@ -112,10 +112,16 @@ async def _check_login(page):
 
 
 async def _wait_csrf(page, tries=50):
-    """等 CSRF hook 抓到 token。抓不到就返回 False，别拿空 token 去请求。"""
+    """等 CSRF hook 抓到 token。抓不到就返回 False，别拿空 token 去请求。
+
+    腾讯云活动页加载后还会自我重定向/重载，导航期间 evaluate 会报
+    "Execution context was destroyed"，吞掉重试。"""
     for _ in range(tries):
-        if await page.evaluate("() => !!window.__latestCsrf"):
-            return True
+        try:
+            if await page.evaluate("() => !!window.__latestCsrf"):
+                return True
+        except Exception:
+            pass  # 导航中，等页面稳下来再试
         await asyncio.sleep(0.2)
     return False
 
@@ -138,70 +144,86 @@ async def do_login():
     c("请在弹出窗口里：点右上角【登录】→ 微信扫码", Fore.CYAN)
     c("（本机已保存过登录态可跳过本步骤）", Fore.WHITE)
 
-    from playwright.async_api import async_playwright
-    pw = await async_playwright().start()
-    browser = await sf.launch_browser(pw, headless=False)
-    ctx = await browser.new_context(viewport={"width": 1400, "height": 900}, user_agent=UA)
-    await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
-    await ctx.add_init_script(sf.CSRF_HOOK_JS)
-    page = await ctx.new_page()
-    page.set_default_timeout(30000)
+    pw = None
+    browser = None
+    try:
+        from playwright.async_api import async_playwright
+        pw = await async_playwright().start()
+        browser = await sf.launch_browser(pw, headless=False)
+        ctx = await browser.new_context(viewport={"width": 1400, "height": 900}, user_agent=UA)
+        await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+        await ctx.add_init_script(sf.CSRF_HOOK_JS)
+        page = await ctx.new_page()
+        page.set_default_timeout(30000)
 
-    log("打开活动页...")
-    await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
-    await asyncio.sleep(3)
-    if not await _wait_csrf(page):
-        log("未捕获到 CSRF token，登录检测可能不准确")
-
-    log("请扫码... (10分钟超时)")
-    deadline = asyncio.get_event_loop().time() + 600
-    ok = False
-    while asyncio.get_event_loop().time() < deadline:
+        log("打开活动页...")
+        await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(3)
-        try:
-            logged, r = await _check_login(page)
-            if logged:
-                ok = True
-                break
-        except Exception as e:
-            log(f"检测异常: {e}")
+        if not await _wait_csrf(page):
+            log("未捕获到 CSRF token，登录检测可能不准确")
 
-    if ok:
-        # 等一下再存：cookie 是扫码后服务端才下发的，立刻存容易存到不完整的一份
-        await asyncio.sleep(1.5)
-        if not await _save_state(ctx):
-            ok = False
-        else:
-            # 用存下来的这份 state 重新开一次，能过才算真的存对了
+        log("请扫码... (10分钟超时)")
+        deadline = asyncio.get_event_loop().time() + 600
+        ok = False
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(3)
             try:
-                vctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
-                await vctx.add_init_script(sf.CSRF_HOOK_JS)
-                vpage = await vctx.new_page()
-                await vpage.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(2)
-                await _wait_csrf(vpage, tries=25)
-                re_ok, _ = await _check_login(vpage)
-                await vctx.close()
-                if not re_ok:
-                    c("登录态复验没过，可能是 CSRF token 没同步，请重试", Fore.YELLOW)
-                    ok = False
-                else:
-                    c("登录成功，登录态已保存", Fore.GREEN)
-                    log("get-vip-info 验证通过，state 复验通过")
+                logged, r = await _check_login(page)
+                if logged:
+                    ok = True
+                    break
             except Exception as e:
-                c(f"复验出错: {e}（已保存的登录态不受影响）", Fore.YELLOW)
-    else:
-        c("10分钟超时未登录", Fore.RED)
+                log(f"检测异常: {e}")
 
-    if ok:
-        c("浏览器先留着，你可以自己看一眼登录状态，按回车关闭", Fore.CYAN)
-        try:
-            input()
-        except (EOFError, KeyboardInterrupt):
-            pass
-    await browser.close()
-    await pw.stop()
-    return ok
+        if ok:
+            # 等一下再存：cookie 是扫码后服务端才下发的，立刻存容易存到不完整的一份
+            await asyncio.sleep(1.5)
+            if not await _save_state(ctx):
+                ok = False
+            else:
+                # 用存下来的这份 state 重新开一次，能过才算真的存对了
+                try:
+                    vctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
+                    await vctx.add_init_script(sf.CSRF_HOOK_JS)
+                    vpage = await vctx.new_page()
+                    await vpage.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(2)
+                    await _wait_csrf(vpage, tries=25)
+                    re_ok, _ = await _check_login(vpage)
+                    await vctx.close()
+                    if not re_ok:
+                        c("登录态复验没过，可能是 CSRF token 没同步，请重试", Fore.YELLOW)
+                        ok = False
+                    else:
+                        c("登录成功，登录态已保存", Fore.GREEN)
+                        log("get-vip-info 验证通过，state 复验通过")
+                except Exception as e:
+                    c(f"复验出错: {e}（已保存的登录态不受影响）", Fore.YELLOW)
+        else:
+            c("10分钟超时未登录", Fore.RED)
+
+        if ok:
+            c("浏览器先留着，你可以自己看一眼登录状态，按回车关闭", Fore.CYAN)
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                pass
+        return ok
+    except Exception as e:
+        c(f"扫码登录过程出错: {str(e)[:120]}", Fore.RED)
+        log(f"do_login 异常: {e}")
+        return False
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
 
 
 # ---------- 抢购 ----------
@@ -218,6 +240,8 @@ async def ensure_login():
         c("  未登录，操作已取消", Fore.RED)
         return False
 
+    pw = None
+    browser = None
     try:
         from playwright.async_api import async_playwright
         pw = await async_playwright().start()
@@ -229,11 +253,21 @@ async def ensure_login():
         await asyncio.sleep(2)
         await _wait_csrf(page, tries=25)
         logged, _ = await _check_login(page)
-        await browser.close()
-        await pw.stop()
     except Exception as e:
         log(f"登录态校验异常，按有效处理: {e}")
         return True
+    finally:
+        # 校验异常时也把浏览器资源收回，不留后台残留
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
 
     if logged:
         log("登录态有效")
@@ -329,9 +363,39 @@ async def run_grab(region_id, target_time=None):
             now_ms = int(time.time() * 1000) + offset_ms
             remaining = (target_dt.timestamp() * 1000 - now_ms) / 1000
 
-            # 剩余 3 分钟再对一次时，修正长时间等待带来的漂移
+            # 剩余 3 分钟：刷新页面 + 复验登录 + 重新对时。
+            # 挂机数小时的会话，CSRF token / 登录态都可能过期，
+            # 开抢前必须让页面重新生成 token，并确认登录仍然有效。
             if remaining <= 180 and not resynced:
-                log("剩余3分钟，重新对时...")
+                if remaining > 60:
+                    log("剩余3分钟，刷新页面并重新对时...")
+                    csrf_ok = False
+                    for attempt in (1, 2):
+                        try:
+                            if attempt == 1:
+                                await page.reload(wait_until="domcontentloaded", timeout=30000)
+                            else:
+                                await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
+                            await asyncio.sleep(2)
+                            csrf_ok = await _wait_csrf(page, tries=50)
+                            if csrf_ok:
+                                break
+                            log(f"  第{attempt}次刷新后未捕获到 CSRF，重试...")
+                        except Exception as e:
+                            log(f"  第{attempt}次刷新失败: {str(e)[:80]}")
+                    if csrf_ok:
+                        try:
+                            logged, r = await _check_login(page)
+                            if logged:
+                                log("登录态复验通过")
+                            else:
+                                c(f"!! 登录态疑似失效（{r.get('code') or r.get('__err')}），如持续失败请中断后重新扫码", Fore.RED)
+                        except Exception as e:
+                            log(f"登录复验异常: {str(e)[:80]}")
+                    else:
+                        c("!! 刷新后仍未捕获到 CSRF token，开抢可能失败，请留意", Fore.RED)
+                else:
+                    log("临近开抢（不足60秒），跳过页面刷新，只重新对时...")
                 offset_ms = await sf.sync_time(page)
                 resynced = True
                 continue
@@ -408,29 +472,44 @@ async def test_connect(region_id):
     if not STATE_PATH.exists():
         if not await ensure_login():
             return False
-    from playwright.async_api import async_playwright
-    pw = await async_playwright().start()
-    browser = await sf.launch_browser(pw, headless=True)
-    ctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
-    await ctx.add_init_script(sf.CSRF_HOOK_JS)
-    page = await ctx.new_page()
-    await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
-    await asyncio.sleep(3)
-    await _wait_csrf(page, tries=25)
-    logged, r = await _check_login(page)
-    label = {
-        "ok": "有效",
-        "not-logged": f"无效 ({r.get('code')})",
-        "unknown": f"未知 ({r.get('code') or r.get('__err')})",
-    }[_login_state(r)]
-    c(f"  登录态: {label}", Fore.GREEN if logged else Fore.RED)
-    c(f"  地域: {REGIONS.get(region_id)} (regionId={region_id})", Fore.CYAN)
-    if logged:
-        c("  测试通过，参数就绪，可以开抢。", Fore.GREEN)
-    else:
-        c("  登录态无效，需要重新扫码登录。", Fore.RED)
-    await browser.close()
-    await pw.stop()
+    pw = None
+    browser = None
+    try:
+        from playwright.async_api import async_playwright
+        pw = await async_playwright().start()
+        browser = await sf.launch_browser(pw, headless=True)
+        ctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
+        await ctx.add_init_script(sf.CSRF_HOOK_JS)
+        page = await ctx.new_page()
+        await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(3)
+        await _wait_csrf(page, tries=25)
+        logged, r = await _check_login(page)
+        label = {
+            "ok": "有效",
+            "not-logged": f"无效 ({r.get('code')})",
+            "unknown": f"未知 ({r.get('code') or r.get('__err')})",
+        }[_login_state(r)]
+        c(f"  登录态: {label}", Fore.GREEN if logged else Fore.RED)
+        c(f"  地域: {REGIONS.get(region_id)} (regionId={region_id})", Fore.CYAN)
+        if logged:
+            c("  测试通过，参数就绪，可以开抢。", Fore.GREEN)
+        else:
+            c("  登录态无效，需要重新扫码登录。", Fore.RED)
+    except Exception as e:
+        log(f"连通测试异常: {str(e)[:120]}")
+        return False
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
     if not logged:
         y = input("  是否现在重新扫码登录？(y/n): ").strip().lower()
         if y == "y":
@@ -451,33 +530,47 @@ async def test_order(region_id):
         c("  已取消", Fore.YELLOW)
         return
     goods = {**sf.TEST_GOODS, "goods_param": {**sf.TEST_GOODS["goods_param"], "regionId": region_id}}
-    from playwright.async_api import async_playwright
-    pw = await async_playwright().start()
-    browser = await sf.launch_browser(pw, headless=True)
-    ctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
-    await ctx.add_init_script(sf.CSRF_HOOK_JS)
-    page = await ctx.new_page()
-    page.set_default_timeout(30000)
-    await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
-    await asyncio.sleep(3)
-    await _wait_csrf(page)
-    logged, _ = await _check_login(page)
+    pw = None
+    browser = None
+    try:
+        from playwright.async_api import async_playwright
+        pw = await async_playwright().start()
+        browser = await sf.launch_browser(pw, headless=True)
+        ctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
+        await ctx.add_init_script(sf.CSRF_HOOK_JS)
+        page = await ctx.new_page()
+        page.set_default_timeout(30000)
+        await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(3)
+        await _wait_csrf(page)
+        logged, _ = await _check_login(page)
+        if not logged:
+            c("  登录态无效，需要重新扫码登录。", Fore.RED)
+        else:
+            c("  开始测试下单（服务器专区商品，持续5秒）...", Fore.CYAN)
+            success = await sf.rapid_purchase(page, goods, duration=5)
+            if success:
+                c("  测试下单成功（记得去控制台取消该订单）", Fore.GREEN)
+            else:
+                c("  测试完成（未下单成功，查看上方日志判断原因）", Fore.YELLOW)
+    except Exception as e:
+        log(f"测试下单异常: {str(e)[:120]}")
+        return
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
     if not logged:
-        c("  登录态无效，需要重新扫码登录。", Fore.RED)
-        await browser.close()
-        await pw.stop()
         y = input("  是否现在重新扫码登录？(y/n): ").strip().lower()
         if y == "y":
             await do_login()
-        return
-    c("  开始测试下单（服务器专区商品，持续5秒）...", Fore.CYAN)
-    success = await sf.rapid_purchase(page, goods, duration=5)
-    if success:
-        c("  测试下单成功（记得去控制台取消该订单）", Fore.GREEN)
-    else:
-        c("  测试完成（未下单成功，查看上方日志判断原因）", Fore.YELLOW)
-    await browser.close()
-    await pw.stop()
 
 
 def main():
@@ -523,4 +616,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl+C 中断（如等待场次时想提前退出）：不再打整页 traceback
+        c("\n已中断退出。登录态等进度保存在本地，下次可直接使用。", Fore.YELLOW)

@@ -255,48 +255,55 @@ async def sync_time(page):
         return offset
 
     # 回退：页面 nowTime（静态值，含页面加载延迟，精度较差）
-    offset = await page.evaluate("""
-        () => {
-            const scripts = document.querySelectorAll('script');
-            for (const s of scripts) {
-                const m = (s.textContent||'').match(/"nowTime"\\s*:\\s*(\\d{13})/);
-                if (m) return parseInt(m[1]) - Date.now();
+    try:
+        offset = await page.evaluate("""
+            () => {
+                const scripts = document.querySelectorAll('script');
+                for (const s of scripts) {
+                    const m = (s.textContent||'').match(/"nowTime"\\s*:\\s*(\\d{13})/);
+                    if (m) return parseInt(m[1]) - Date.now();
+                }
+                return 0;
             }
-            return 0;
-        }
-    """)
+        """)
+    except Exception:
+        offset = 0
     log(f"服务器时间偏移: {offset:+d}ms (nowTime回退)")
     return offset
 
 
 async def api_do_goods(page, goods, attempt):
-    """在浏览器上下文中调用 do-goods API"""
-    result = await page.evaluate("""
-        async (params) => {
-            try {
-                const resp = await fetch(params.url, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json', 'x-csrf-token': window.__latestCsrf || ''},
-                    credentials: 'include',
-                    body: JSON.stringify({
-                        activity_id: params.activity_id,
-                        goods: [{act_id: params.act_id, type: params.type, goods_param: params.goods_param}],
-                        agent_channel: {fromChannel: '', fromSales: '', fromUrl: '', isAgentClient: false},
-                        preview: 0,
-                    }),
-                });
-                return await resp.json();
-            } catch(e) {
-                return {code: -1, msg: e.message};
+    """在浏览器上下文中调用 do-goods API（evaluate 异常不炸预热/抢购流程）"""
+    try:
+        result = await page.evaluate("""
+            async (params) => {
+                try {
+                    const resp = await fetch(params.url, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json', 'x-csrf-token': window.__latestCsrf || ''},
+                        credentials: 'include',
+                        body: JSON.stringify({
+                            activity_id: params.activity_id,
+                            goods: [{act_id: params.act_id, type: params.type, goods_param: params.goods_param}],
+                            agent_channel: {fromChannel: '', fromSales: '', fromUrl: '', isAgentClient: false},
+                            preview: 0,
+                        }),
+                    });
+                    return await resp.json();
+                } catch(e) {
+                    return {code: -1, msg: e.message};
+                }
             }
-        }
-    """, {
-        "url": DO_GOODS_URL,
-        "activity_id": goods["activity_id"],
-        "act_id": goods["act_id"],
-        "type": goods["type"],
-        "goods_param": goods.get("goods_param", {}),
-    })
+        """, {
+            "url": DO_GOODS_URL,
+            "activity_id": goods["activity_id"],
+            "act_id": goods["act_id"],
+            "type": goods["type"],
+            "goods_param": goods.get("goods_param", {}),
+        })
+    except Exception as e:
+        log(f"  do-goods 请求异常: {str(e)[:80]}")
+        return False
 
     code = result.get("code")
     msg = result.get("msg", "")
@@ -304,8 +311,8 @@ async def api_do_goods(page, goods, attempt):
     if code == 0:
         deal = result.get("data", {})
         log(f"下单成功 #{attempt}")
-        log(f"   订单号: {deal.get('deal_names', ['?'])[0]}")
-        log(f"   大单号: {deal.get('big_deal_no', '?')}")
+        log(f"   订单号: {(deal.get('deal_names') or ['?'])[0]}")
+        log(f"   大单号: {deal.get('big_deal_no') or '?'}")
         return True
     elif attempt <= 5 or code != 1435936:
         if attempt <= 10:
@@ -327,40 +334,49 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
     start = time.monotonic()
     attempt = 0
     success = False
+    err_count = 0
 
     while time.monotonic() - start < duration:
         # 批量发起：一次 evaluate 发 CONCURRENCY 个并发 fetch
-        batch_result = await page.evaluate("""
-            async (params) => {
-                const results = [];
-                const promises = [];
-                for (let i = 0; i < params.concurrency; i++) {
-                    promises.push(
-                        fetch(params.url, {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json', 'x-csrf-token': window.__latestCsrf || ''},
-                            credentials: 'include',
-                            body: JSON.stringify({
-                                activity_id: params.activity_id,
-                                goods: [{act_id: params.act_id, type: params.type, goods_param: params.goods_param}],
-                                agent_channel: {fromChannel: '', fromSales: '', fromUrl: '', isAgentClient: false},
-                                preview: 0,
-                            }),
-                        })
-                        .then(r => r.json())
-                        .catch(e => ({code: -1, msg: e.message}))
-                    );
+        # evaluate 可能撞页面导航/关闭抛错，单轮失败不中断整个抢购窗口
+        try:
+            batch_result = await page.evaluate("""
+                async (params) => {
+                    const results = [];
+                    const promises = [];
+                    for (let i = 0; i < params.concurrency; i++) {
+                        promises.push(
+                            fetch(params.url, {
+                                method: 'POST',
+                                headers: {'Content-Type': 'application/json', 'x-csrf-token': window.__latestCsrf || ''},
+                                credentials: 'include',
+                                body: JSON.stringify({
+                                    activity_id: params.activity_id,
+                                    goods: [{act_id: params.act_id, type: params.type, goods_param: params.goods_param}],
+                                    agent_channel: {fromChannel: '', fromSales: '', fromUrl: '', isAgentClient: false},
+                                    preview: 0,
+                                }),
+                            })
+                            .then(r => r.json())
+                            .catch(e => ({code: -1, msg: e.message}))
+                        );
+                    }
+                    return await Promise.all(promises);
                 }
-                return await Promise.all(promises);
-            }
-        """, {
-            "url": DO_GOODS_URL,
-            "activity_id": goods["activity_id"],
-            "act_id": goods["act_id"],
-            "type": goods["type"],
-            "goods_param": goods.get("goods_param", {}),
-            "concurrency": CONCURRENCY,
-        })
+            """, {
+                "url": DO_GOODS_URL,
+                "activity_id": goods["activity_id"],
+                "act_id": goods["act_id"],
+                "type": goods["type"],
+                "goods_param": goods.get("goods_param", {}),
+                "concurrency": CONCURRENCY,
+            })
+        except Exception as e:
+            err_count += 1
+            if err_count <= 3:
+                log(f"  本轮请求异常: {str(e)[:80]}")
+            await asyncio.sleep(ROUND_INTERVAL_MS / 1000)
+            continue
 
         attempt += CONCURRENCY
 
@@ -370,8 +386,8 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
             if code == 0:
                 deal = r.get("data", {})
                 log("下单成功")
-                log(f"   订单号: {deal.get('deal_names', ['?'])[0]}")
-                log(f"   大单号: {deal.get('big_deal_no', '?')}")
+                log(f"   订单号: {(deal.get('deal_names') or ['?'])[0]}")
+                log(f"   大单号: {deal.get('big_deal_no') or '?'}")
                 success = True
                 break
 
@@ -447,10 +463,13 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
         goods = TEST_GOODS if test_mode else FLASH_SALE
         log(f"商品: {goods['name']}")
 
-        # 等待前端 CSRF token 就绪
+        # 等待前端 CSRF token 就绪（页面导航期间 evaluate 会报上下文销毁，吞掉重试）
         for _ in range(50):
-            if await page.evaluate("() => !!window.__latestCsrf"):
-                break
+            try:
+                if await page.evaluate("() => !!window.__latestCsrf"):
+                    break
+            except Exception:
+                pass
             await asyncio.sleep(0.2)
         else:
             log("未捕获到 CSRF token，请求可能失败")
