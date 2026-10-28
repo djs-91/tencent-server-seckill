@@ -242,7 +242,7 @@ async def ensure_login():
         if y == "y":
             await do_login()
         if STATE_PATH.exists():
-            c("已保存登录态，用 [5] 测试连通 可以确认是否有效", Fore.YELLOW)
+            c("已保存登录态（每次操作前都会自动校验有效性）", Fore.YELLOW)
             return True
         c("  未登录，操作已取消", Fore.RED)
         return False
@@ -260,6 +260,12 @@ async def ensure_login():
         await asyncio.sleep(2)
         await _wait_csrf(page, tries=25)
         logged, _ = await _check_login(page)
+        if not logged:
+            # 首屏没就绪或被 EdgeOne 挑战页拦一下时会瞬时失败，再等一轮重试，
+            # 否则会误判登录态失效、让人白扫一次码
+            await asyncio.sleep(3)
+            await _wait_csrf(page, tries=25)
+            logged, _ = await _check_login(page)
     except Exception as e:
         log(f"登录态校验异常，按有效处理: {e}")
         return True
@@ -359,9 +365,6 @@ async def run_grab(region_id, target_time=None):
             goods_box["goods"] = found
             log(f"商品: {found['name']} act_id={found['act_id']} "
                 f"activity_id={found['activity_id']}")
-            q = await sf.calc_quota(page, found)
-            if q:
-                log(f"库存: 剩 {q.get('available')}/{q.get('total_num')}")
 
         offset_ms = await sf.sync_time(page)
         await refresh_goods()
@@ -485,8 +488,7 @@ def show_menu():
     c("  [2] 扫码登录（首次或登录过期时）", Fore.WHITE)
     c("  [3] 开始抢购（自动找最近场次 10:00/15:00）", Fore.WHITE)
     c("  [4] 选择场次抢购（10:00 / 15:00）", Fore.WHITE)
-    c("  [5] 测试连通（验证登录+参数，不抢购）", Fore.WHITE)
-    c("  [6] 试单（preview=1 真实校验，不下单不扣费）", Fore.WHITE)
+    c("  [5] 测试下单流程（不付款；测完取消订单，不要反复测）", Fore.WHITE)
     c("  [0] 退出", Fore.WHITE)
     c("-" * 56, Fore.WHITE)
     c("免责声明: 本工具仅供个人学习使用；自动化抢购可能违反", Fore.YELLOW)
@@ -494,64 +496,27 @@ def show_menu():
     c("=" * 56, Fore.YELLOW)
 
 
-async def test_connect(region_id):
-    """headless 打开页面验一下登录，不抢购"""
-    if not STATE_PATH.exists():
-        if not await ensure_login():
-            return False
-    pw = None
-    browser = None
-    try:
-        from playwright.async_api import async_playwright
-        pw = await async_playwright().start()
-        browser = await sf.launch_browser(pw, headless=True)
-        ctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
-        await ctx.add_init_script(sf.CSRF_HOOK_JS)
-        page = await ctx.new_page()
-        await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(3)
-        await _wait_csrf(page, tries=25)
-        logged, r = await _check_login(page)
-        label = {
-            "ok": "有效",
-            "not-logged": f"无效 ({r.get('code')})",
-            "unknown": f"未知 ({r.get('code') or r.get('__err')})",
-        }[_login_state(r)]
-        c(f"  登录态: {label}", Fore.GREEN if logged else Fore.RED)
-        c(f"  地域: {REGIONS.get(region_id)} (regionId={region_id})", Fore.CYAN)
-        if logged:
-            c("  测试通过，参数就绪，可以开抢。", Fore.GREEN)
-        else:
-            c("  登录态无效，需要重新扫码登录。", Fore.RED)
-    except Exception as e:
-        log(f"连通测试异常: {str(e)[:120]}")
-        return False
-    finally:
-        if browser:
-            try:
-                await browser.close()
-            except Exception:
-                pass
-        if pw:
-            try:
-                await pw.stop()
-            except Exception:
-                pass
-    if not logged:
-        y = input("  是否现在重新扫码登录？(y/n): ").strip().lower()
-        if y == "y":
-            await do_login()
-    return logged
-
-
-async def test_order(region_id):
-    """试单：preview=1 走真实校验链路，但不创建订单、不扣费"""
+async def test_once(region_id):
+    """测试下单流程：do-goods(preview=0) 真下单、不付款。用 109 元专区商品，不受场次时间窗限制。"""
     if not await ensure_login():
         return
-    c("=" * 56, Fore.CYAN)
-    c("  试单说明：preview=1 会真实走登录/参数/资格/时间窗校验，", Fore.WHITE)
-    c("  但不会创建订单、不会扣费，可反复使用。", Fore.WHITE)
-    c("=" * 56, Fore.CYAN)
+    c("!" * 58, Fore.YELLOW)
+    c("  测试下单流程：拿 109 元专区商品真下单（preview=0），不付款。", Fore.WHITE)
+    c("  这个商品和 38 元那款配置一样，但不是同一个商品。", Fore.WHITE)
+    c("  能确认：登录态、参数结构、首单资格、能不能建单。", Fore.WHITE)
+    c("  不付款的订单 1 小时后自动关闭。抢之前去订单页取消掉。", Fore.YELLOW)
+    c("  别反复测：短时间多次建单会触发风控，有人被限制到第二天。", Fore.RED)
+    c("!" * 58, Fore.YELLOW)
+    try:
+        y = input("  确认真下单？输入 YES 继续: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if y != "YES":
+        c("  已取消", Fore.YELLOW)
+        return
+
+    goods = {**sf.TEST_GOODS,
+             "goods_param": {**sf.TEST_GOODS["goods_param"], "regionId": region_id}}
     pw = None
     browser = None
     try:
@@ -569,38 +534,21 @@ async def test_order(region_id):
         if not logged:
             c(f"  登录态无效（{r.get('code') or r.get('__err')}），先扫码登录再试。", Fore.RED)
             return
-        c("  登录态: 有效", Fore.GREEN)
-
-        goods = {**sf.TEST_GOODS,
-                 "goods_param": {**sf.TEST_GOODS["goods_param"], "regionId": region_id}}
-        discover, session = await sf.discover_flash_sale(page, region_id)
+        price = await sf.fetch_price(page, goods["activity_id"], goods["act_id"],
+                                     goods["type"], region_id)
+        c(f"  测试商品: {goods['name']} act_id={goods['act_id']}", Fore.CYAN)
+        c(f"  价格: {sf.fmt_price(price)}", Fore.CYAN)
+        if price and price.get("real_cost") != sf.TEST_REAL_COST:
+            c(f"  注意：不是 109 元那款（实际 {sf.fmt_price(price)}），act_id 可能已变", Fore.RED)
         c(f"  地域: {REGIONS.get(region_id, region_id)}", Fore.CYAN)
-        if session:
-            c(f"  最近场次: {session['start']} ~ {session['end']}", Fore.CYAN)
-
-        for tag, g in (("测试商品（109元首单款）", goods),
-                       ("正式秒杀商品（38元款）", discover)):
-            c(f"\n  --- {tag} ---", Fore.WHITE)
-            q = await sf.calc_quota(page, g)
-            if q:
-                c(f"  库存: 剩 {q.get('available')}/{q.get('total_num')}", Fore.WHITE)
-            out = await sf.probe_goods(page, g)
-            code = out.get("code")
-            msg = str(out.get("msg") or "")[:60]
-            if code == sf.CODE_OK:
-                c("  结果: 通过（可抢）", Fore.GREEN)
-            else:
-                desc = sf.CODE_DESC.get(code, "未知含义（建议截图反馈）")
-                color = Fore.GREEN if code == sf.CODE_NOT_STARTED else Fore.RED
-                c(f"  结果: code={code} {desc}", color)
-                if msg:
-                    c(f"  服务器原话: {msg}", Fore.WHITE)
-                if code == sf.CODE_NOT_STARTED:
-                    c("  说明: 时间窗问题（不在场次内），不是配置或账号问题", Fore.GREEN)
-                elif code == sf.CODE_ALREADY_BOUGHT:
-                    c("  说明: 该实名主体已买过这款首单商品，换账号才能验证", Fore.YELLOW)
+        c("  开始测试下单（持续 3 秒）...", Fore.CYAN)
+        ok = await sf.rapid_purchase(page, goods, duration=3)
+        if ok:
+            c("  已建单 —— 请去控制台把这个订单取消掉，不要付款。", Fore.GREEN)
+        else:
+            c("  未成交，看上面日志里的返回码说明。", Fore.YELLOW)
     except Exception as e:
-        log(f"试单异常: {str(e)[:120]}")
+        log(f"真下单异常: {str(e)[:120]}")
         return
     finally:
         if browser:
@@ -613,10 +561,6 @@ async def test_order(region_id):
                 await pw.stop()
             except Exception:
                 pass
-    if not logged:
-        y = input("  是否现在重新扫码登录？(y/n): ").strip().lower()
-        if y == "y":
-            await do_login()
 
 
 def main():
@@ -650,9 +594,7 @@ def main():
             else:
                 c("  无效输入（请输入 1 或 2）", Fore.RED)
         elif choice == "5":
-            asyncio.run(test_connect(cfg.get("region", 8)))
-        elif choice == "6":
-            asyncio.run(test_order(cfg.get("region", 8)))
+            asyncio.run(test_once(cfg.get("region", 8)))
         elif choice == "0":
             break
         else:

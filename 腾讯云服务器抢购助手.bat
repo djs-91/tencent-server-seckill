@@ -1,5 +1,14 @@
 @echo off
-chcp 65001 >nul
+rem No `chcp` here on purpose: on Windows, CPython writes console output through
+rem the wide-char API, so Chinese renders correctly whatever the console codepage
+rem is. `chcp` would additionally swallow a redirected stdin, which breaks
+rem `助手.bat < answers.txt` style automation.
+rem
+rem This file is UTF-8, so every echo/title line below stays pure ASCII:
+rem cmd prints its own text using the console codepage, and Chinese here
+rem would show as mojibake on a CP936 or CP437 console. All Chinese UI text
+rem is printed by Python instead, which writes through the wide-char console
+rem API and is codepage-independent.
 setlocal EnableExtensions
 title Tencent Cloud Server Seckill Helper
 cd /d "%~dp0"
@@ -73,7 +82,9 @@ exit /b %RC%
 rem ---- helper: accept a python candidate only if it runs on 3.10+ ----
 :try
 rem %~1 = executable path, %~2 = where it came from (display only)
-"%~1" -c "import sys; sys.exit(0 if sys.version_info[:2] >= (3, 10) else 3)" >nul 2>nul
+rem `<nul` matters: the probe must not touch stdin, otherwise a piped/redirected
+rem stdin gets consumed by the version check before the menu ever reads it.
+"%~1" -c "import sys; sys.exit(0 if sys.version_info[:2] >= (3, 10) else 3)" <nul >nul 2>nul
 if errorlevel 1 exit /b 0
 set "PYTHON=%~1"
 set "PY_DISPLAY=%~2"

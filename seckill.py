@@ -78,7 +78,7 @@ FLASH_SALE_LEGACY = {
     "goods_param": dict(GOODS_PARAM),
 }
 
-# 试单商品：轻量4核4G3M 109元/年（服务器专区），不受秒杀时间窗限制，随时能验
+# 测试下单用商品：轻量4核4G3M 109元/年（服务器专区），不受秒杀时间窗限制，随时能验
 # 注意：它和 38 元那款是同一个「首单」SKU。买过任意一个，另一个也会返回
 # 1100106「已购买此产品」—— 那是账号状态，不是程序出错。
 TEST_GOODS = {
@@ -88,6 +88,28 @@ TEST_GOODS = {
     "name": "轻量4核4G3M (109元/年·专区)",
     "goods_param": dict(GOODS_PARAM),
 }
+
+# 价格校验：38 元那款活动价 3800 分、日常价 78000 分、折扣率 4.8718。
+# 这个值不受账号影响 —— 实测账号已经用过首单资格，query-price 依然返回 3800，
+# 所以它能当「是不是要抢的那一款」的判别条件。
+EXPECT_REAL_COST = 3800
+# [5] 测试下单用的 109 元专区商品
+TEST_REAL_COST = 10900
+
+
+def fmt_price(price):
+    """把 query-price 的返回转成人话，price 为空表示没查到"""
+    if not price:
+        return "价格未知"
+    real = price.get("real_cost")
+    total = price.get("total_cost")
+    if real is None:
+        return "价格未知"
+    txt = f"活动价 {real / 100:.2f} 元"
+    if total:
+        txt += f" / 日常价 {total / 100:.2f} 元"
+    return txt
+
 
 SECKILL_TIMES = ["10:00", "15:00"]
 
@@ -100,10 +122,16 @@ DURATION_SEC = 10
 # 每轮间隔 (毫秒)
 ROUND_INTERVAL_MS = 20
 
-# 提前多少毫秒开始发请求 (负数=提前，正数=延后)
-# 实测提前发只会拿到 1101001「秒杀尚未开始」——服务端按自己的时钟判窗口，
-# 所以默认 0（准点开火）。想激进一点可以 -200，再大就是白送请求。
-ADVANCE_MS = 0
+# 提前多少毫秒开火（负数=提前，相对本机推算出的开抢时刻）
+#
+# 恢复成早期版本的 3 秒：对时永远有误差（采样取中位数，实测 ±0.1s，抖动更大），
+# 早发只是换来几条「1101001 秒杀尚未开始」，循环会继续打，不损失任何机会；
+# 而晚发是直接错过窗口，补不回来。所以宁可早，代价只是多几百条废请求。
+#
+# 唯一的副作用是请求量：3 秒 × 500req/s ≈ 1500 条，可能招活动风控
+# （接口里 anti_brush_version=v3）。如果日志开始出现限流类返回码，
+# 把这里调成 -500 即可，别调成 0。
+ADVANCE_MS = -3000
 
 # ---- do-goods 业务返回码 ----
 CODE_OK = 0
@@ -340,11 +368,69 @@ async def discover_activity_id(page):
         return 0
 
 
+async def fetch_price(page, activity_id, act_id, type_, region_id):
+    """问一次价格。免登录可用，用来确认这个 act_id 是不是 38 元那款。
+
+    不需要 activity_id 之外的参数，goods 里也不能带 activity_id（会 400）。
+    返回 None 表示查不到（接口报错或结构变了），调用方要能容忍。
+    """
+    r = await api_post(page, "/dianshi/query-price", {
+        "activity_id": int(activity_id),
+        "goods": [{
+            "act_id": int(act_id),
+            "type": type_,
+            "goods_param": {**GOODS_PARAM, "regionId": region_id},
+        }],
+        "preview": 0,
+    })
+    if r.get("code") != CODE_OK:
+        return None
+    for item in (r.get("data") or []):
+        if int(item.get("act_id") or 0) == int(act_id):
+            return item
+    return None
+
+
 def _is_lighthouse(sale):
     """场次里的 sales 是不是轻量应用服务器那条"""
     if (sale.get("product_name") or "") == "lighthouse_v5":
         return True
     return "轻量" in (sale.get("goods_name") or "")
+
+
+# 选中依据的优先级：type 与价格两个条件互相印证。
+# type 指 sales[].product_name，轻量应用服务器固定是 "lighthouse_v5"
+# （注意别跟 goods_param.type=bundle_budget_mc_lg4_01 混了，那是规格包编号）。
+RANK_DESC = {
+    0: "type=lighthouse_v5 + 价格对上 38 元",
+    1: "type=lighthouse_v5（价格没对上或没查到）",
+    2: "价格对上 38 元 + 名字含轻量",
+    3: "只有价格对上 38 元，type/名字都没认出来",
+    4: "只有名字含轻量",
+    9: "type、名字、价格都没对上",
+}
+
+
+def _rank_candidate(sale, price):
+    """给场次里的商品打分，越小越像要抢的那款。
+
+    type 来自接口字段，比商品名稳定；价格是独立的一道校验。
+    两个都对上最好；只有一个对上时宁可要 type（腾讯自己声明的商品类型）。
+    """
+    by_type = (sale.get("product_name") or "") == "lighthouse_v5"
+    by_name = "轻量" in (sale.get("goods_name") or "")
+    by_price = bool(price) and price.get("real_cost") == EXPECT_REAL_COST
+    if by_type and by_price:
+        return 0
+    if by_type:
+        return 1
+    if by_price and by_name:
+        return 2
+    if by_price:
+        return 3
+    if by_name:
+        return 4
+    return 9
 
 
 async def discover_flash_sale(page, region_id=8):
@@ -385,43 +471,55 @@ async def discover_flash_sale(page, region_id=8):
         past.sort(key=lambda x: x[2])
 
         for date_str, s, start in (upcoming[:1] or past[-1:]):
-            for sale in (s.get("sales") or []):
-                if not _is_lighthouse(sale):
-                    continue
+            sales = s.get("sales") or []
+            # 整场商品都问一遍价格。非轻量的商品会报 1100109（goods_param 不属于它们），
+            # 拿不到价格就排到最后，不影响判断。
+            cands = []
+            for sale in sales:
+                typ = sale.get("product_name") or ""
                 goods = {
                     "act_id": int(sale["act_id"]),
                     "activity_id": int(act),
-                    "type": sale.get("product_name") or "lighthouse_v5",
+                    "type": typ or "lighthouse_v5",
                     "name": "轻量4核4G3M (38元/年)",
                     "goods_param": {**GOODS_PARAM, "regionId": region_id},
                 }
-                session = {
-                    "id": s.get("id"),
-                    "start": start.strftime("%Y-%m-%d %H:%M:%S"),
-                    "end": f"{date_str} {s.get('end_time')}",
-                    "started": start.timestamp() <= now,
-                }
-                return goods, session
+                price = await fetch_price(page, act, goods["act_id"], goods["type"], region_id)
+                cands.append((_rank_candidate(sale, price), goods, price, sale))
+
+            cands.sort(key=lambda c: c[0])
+            rank, goods, price, _sale = cands[0]
+            why = RANK_DESC.get(rank, "都没对上")
+            if price and price.get("real_cost") != EXPECT_REAL_COST:
+                why += f"，价格是 {fmt_price(price)}"
+
+            goods["price"] = price
+            goods["price_check"] = why
+            session = {
+                "id": s.get("id"),
+                "start": start.strftime("%Y-%m-%d %H:%M:%S"),
+                "end": f"{date_str} {s.get('end_time')}",
+                "started": start.timestamp() <= now,
+            }
+            return goods, session
 
     log("自动发现失败，使用代码里的兜底 id（可能已过期，会返回 1101001）")
     log("  排查：1) 活动页是否换了地址 → 改 ACTIVITY_URL")
     log("        2) 是否已换新活动 → 把新 activity_id 加进 CANDIDATE_ACTIVITY_IDS")
     fallback = {**FLASH_SALE, "goods_param": {**FLASH_SALE["goods_param"], "regionId": region_id}}
+    price = await fetch_price(page, fallback["activity_id"], fallback["act_id"],
+                              fallback["type"], region_id)
+    fallback["price"] = price
+    if price and price.get("real_cost") != EXPECT_REAL_COST:
+        fallback["price_check"] = "兜底 id 价格对不上"
+        log(f"  注意：兜底商品是 {fmt_price(price)}，不是 38 元")
+    else:
+        fallback["price_check"] = "兜底 id" if price else "兜底 id，价格未校验"
     return fallback, None
 
 
-async def calc_quota(page, goods):
-    """查库存（只读）。注意这个接口不吃 activity_id，只吃 goods_id_list"""
-    r = await api_post(page, "/dianshi/calc-goods-quota",
-                       {"goods_id_list": [int(goods["act_id"])]})
-    if r.get("code") != CODE_OK:
-        return None
-    lst = ((r.get("data") or {}).get("goods_quota_list") or [])
-    return lst[0] if lst else None
-
-
 async def do_goods_raw(page, goods, preview=0, concurrency=1):
-    """调 do-goods。preview=1 是试单：服务端完整校验，但不产生订单。
+    """调 do-goods。preview=1 是预检：服务端完整校验，但不产生订单。
     返回 list（并发时有多条）。"""
     result = await page.evaluate("""
         async (params) => {
@@ -459,7 +557,7 @@ async def do_goods_raw(page, goods, preview=0, concurrency=1):
 
 
 async def probe_goods(page, goods):
-    """preview=1 试单：真实走一遍服务端校验，但不产生订单。返回原始返回体。"""
+    """preview=1 预检：真实走一遍服务端校验，但不产生订单。返回原始返回体。"""
     results = await do_goods_raw(page, goods, preview=1, concurrency=1)
     return results[0] if results else {"code": -1, "msg": "无返回"}
 
@@ -491,11 +589,19 @@ async def api_do_goods(page, goods, attempt, preview=0):
 
 
 async def warmup(page, goods):
-    """预热连接：提前发一个「试单」把 TCP/TLS 建好，到点直接用。
-    用 preview=1，不会真的下单。"""
+    """预热连接：提前发一个「预检请求」把 TCP/TLS 建好，到点直接用。
+    用 preview=1，不会真的下单。返回服务端返回体，供上层判断是否需要中止。"""
     log("预热连接...")
-    result = await api_do_goods(page, goods, 0, preview=1)
-    log(f"  预热完成 (结果: {'成功' if result else '未到时间，正常'})")
+    result = await probe_goods(page, goods)
+    code = result.get("code")
+    if code == CODE_OK:
+        log("  预热返回成功（说明此刻已在窗口内且资格 OK）")
+    elif code in NO_RETRY_CODES:
+        log(f"  预热返回 {code}: {CODE_DESC.get(code, '')}")
+        log(f"  服务器原话: {str(result.get('msg') or '')[:70]}")
+    else:
+        log(f"  预热完成（code={code}，未到时间属正常）")
+    return result
 
 
 async def rapid_purchase(page, goods, duration=DURATION_SEC):
@@ -507,6 +613,7 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
     success = False
     err_count = 0
     last_code = None
+    seen_codes = {}
 
     while time.monotonic() - start < duration:
         # 批量发起：一次 evaluate 发 CONCURRENCY 个并发 fetch
@@ -536,8 +643,12 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
                 log(f"   大单号: {deal.get('big_deal_no') or '?'}")
                 success = True
                 break
+            if code not in seen_codes:
+                # 同一种返回码只报一次，避免刷屏；但一定带上服务器的原话
+                seen_codes[code] = 1
+                log(f"  返回 {code}: {CODE_DESC.get(code, '未知含义（建议截图反馈）')}"
+                    f" | {str(r.get('msg') or '')[:60]}")
             if code in NO_RETRY_CODES:
-                log(f"  返回 {code}: {CODE_DESC.get(code, r.get('msg', ''))}")
                 log("  这类错误重试没有意义，本场停止。")
                 fatal = True
                 break
@@ -619,7 +730,7 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
         # 同步时间
         offset_ms = await sync_time(page)
 
-        # 商品：测试模式用专区商品，正常模式用自动发现的秒杀商品
+        # 商品：--test 用专区商品，正常模式用自动发现的秒杀商品
         goods = TEST_GOODS if test_mode else FLASH_SALE
         log(f"商品(初始): {goods['name']}")
 
@@ -644,25 +755,26 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
             goods = found
             log(f"商品: {goods['name']} act_id={goods['act_id']} "
                 f"activity_id={goods['activity_id']}")
-            quota = await calc_quota(page, goods)
-            if quota:
-                log(f"库存: 剩 {quota.get('available')}/{quota.get('total_num')}")
+            log(f"  价格: {fmt_price(goods.get('price'))}"
+                f"（{goods.get('price_check', '未校验')}）")
         else:
-            log(f"试单商品: {goods['name']} act_id={goods['act_id']}")
+            log(f"测试商品: {goods['name']} act_id={goods['act_id']}")
 
         if test_mode:
-            log("测试模式: preview=1 试单（真实走一遍校验，不会下单）")
-            r = await probe_goods(page, goods)
-            code = r.get("code")
-            log(f"返回 code={code} msg={str(r.get('msg'))[:80]}")
-            if code == CODE_OK:
-                log("试单通过：登录、参数、资格全 OK，可以开抢")
-            elif code in CODE_DESC:
-                log(f"含义: {CODE_DESC[code]}")
-                if code == CODE_NOT_STARTED:
-                    log("这是时间窗问题，不是配置问题 —— 到点再抢就行")
-                elif code == CODE_ALREADY_BOUGHT:
-                    log("这是账号状态：该实名主体已买过这款首单商品，换账号才能试")
+            log("测试下单流程：用 109 元专区商品真下单（preview=0），不付款")
+            log("  与 38 元那款不是同一商品，仅同配置；可验证登录/参数/首单资格/建单")
+            log("  测完请到控制台取消订单；不要频繁测，反复建单容易触发风控")
+            price = await fetch_price(page, goods["activity_id"], goods["act_id"],
+                                      goods["type"], goods["goods_param"].get("regionId", 8))
+            log(f"  价格: {fmt_price(price)}")
+            if price and price.get("real_cost") != TEST_REAL_COST:
+                log(f"  注意：这个不是 109 元的测试商品（实际 {fmt_price(price)}），"
+                    f"act_id 可能已经变了")
+            ok = await rapid_purchase(page, goods, duration=5)
+            if ok:
+                log("已建单 —— 请去控制台取消订单，不要付款。")
+            else:
+                log("未成交，看上面的返回码说明。")
             return
 
         # 等待抢购时间
@@ -691,9 +803,9 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
                 resynced = True
                 continue  # 用新偏移重算 remaining
 
-            # remaining 是正数表示还没到点，所以是 <= 3.0s 时开始（即提前3秒）
+            # remaining 是正数表示还没到点，所以是 <= 300ms 时开始（即提前 300ms）
             if remaining * 1000 <= -ADVANCE_MS:
-                log(f"提前 {abs(ADVANCE_MS)}ms 开始")
+                log(f"提前 {abs(ADVANCE_MS)}ms 开火")
                 break
 
             if remaining <= 10:
@@ -701,10 +813,13 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
             elif int(remaining) % 60 == 0:
                 log(f"  还剩 {remaining/60:.0f}min")
 
-            # 提前10秒发一个请求，把连接建好
+            # 提前10秒发一个请求，把连接建好；顺便确认资格，没资格就别白等
             if remaining <= WARMUP_SECONDS and not warmed_up:
-                await warmup(page, goods)
                 warmed_up = True
+                probe = await warmup(page, goods)
+                if probe.get("code") in NO_RETRY_CODES:
+                    log("开抢前已知资格不满足，中止本场（不必空等）")
+                    return
 
             await asyncio.sleep(0.05 if remaining <= 5 else 1)
 
@@ -735,7 +850,8 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
 def main():
     parser = argparse.ArgumentParser(description="腾讯云服务器抢购终极方案")
     parser.add_argument("--time", type=str, help="HH:MM")
-    parser.add_argument("--test", action="store_true", help="测试模式")
+    parser.add_argument("--test", action="store_true",
+                        help="测试下单流程：用 109 元专区商品真下单（不付款，测完请及时取消）")
     parser.add_argument("--loop", action="store_true", help="持续运行")
     args = parser.parse_args()
 
