@@ -348,7 +348,23 @@ async def run_grab(region_id, target_time=None):
         if not await _wait_csrf(page):
             c("未捕获到 CSRF token，请求可能被拒绝", Fore.YELLOW)
 
+        # 商品 id 现查：腾讯换活动就换 act_id，写死在代码里必然过期
+        goods_box = {"goods": goods}
+
+        async def refresh_goods():
+            found, session = await sf.discover_flash_sale(page, region_id)
+            if session:
+                log(f"活动 {found['activity_id']} | 场次 {session['start']} ~ "
+                    f"{session['end']} (id={session['id']})")
+            goods_box["goods"] = found
+            log(f"商品: {found['name']} act_id={found['act_id']} "
+                f"activity_id={found['activity_id']}")
+            q = await sf.calc_quota(page, found)
+            if q:
+                log(f"库存: 剩 {q.get('available')}/{q.get('total_num')}")
+
         offset_ms = await sf.sync_time(page)
+        await refresh_goods()
 
         if target_time:
             now = datetime.fromtimestamp((int(time.time() * 1000) + offset_ms) / 1000)
@@ -404,6 +420,10 @@ async def run_grab(region_id, target_time=None):
                 else:
                     log("临近开抢（不足60秒），跳过页面刷新，只重新对时...")
                 offset_ms = await sf.sync_time(page)
+                try:
+                    await refresh_goods()
+                except Exception as e:
+                    log(f"重新拉取场次失败（沿用上次结果）: {str(e)[:80]}")
                 resynced = True
                 continue
 
@@ -417,12 +437,12 @@ async def run_grab(region_id, target_time=None):
                 log(f"  还剩 {remaining/60:.0f}min")
 
             if remaining <= sf.WARMUP_SECONDS and not warmed_up:
-                await sf.warmup(page, goods)
+                await sf.warmup(page, goods_box["goods"])
                 warmed_up = True
 
             await asyncio.sleep(0.05 if remaining <= 5 else 1)
 
-        success = await sf.rapid_purchase(page, goods)
+        success = await sf.rapid_purchase(page, goods_box["goods"])
         stop_hb["v"] = True
         if success:
             c("\n" + "=" * 40, Fore.GREEN)
@@ -455,8 +475,8 @@ def show_menu():
     state_exists = STATE_PATH.exists()
     c("=" * 56, Fore.YELLOW)
     c("        腾讯云服务器抢购助手", Fore.YELLOW + Style.BRIGHT)
-    c("  活动: 上云精选·限时秒杀（轻量应用服务器 38元/年）", Fore.WHITE)
-    c("  https://cloud.tencent.com/act/pro/featured-202607#MS", Fore.WHITE)
+    c("  活动: 上云精选·限时秒杀（轻量应用服务器，每天 10:00 / 15:00）", Fore.WHITE)
+    c("  商品 id 每期活动会变，程序启动时自动现查，无需手动改", Fore.WHITE)
     c("=" * 56, Fore.YELLOW)
     c(f"  服务器地域: {REGIONS.get(region, region)}", Fore.CYAN)
     c(f"  登录状态  : {'已保存(使用时自动校验)' if state_exists else '未登录'}", Fore.CYAN)
@@ -466,7 +486,7 @@ def show_menu():
     c("  [3] 开始抢购（自动找最近场次 10:00/15:00）", Fore.WHITE)
     c("  [4] 选择场次抢购（10:00 / 15:00）", Fore.WHITE)
     c("  [5] 测试连通（验证登录+参数，不抢购）", Fore.WHITE)
-    c("  [6] 测试下单（真实下单，慎用！）", Fore.RED)
+    c("  [6] 试单（preview=1 真实校验，不下单不扣费）", Fore.WHITE)
     c("  [0] 退出", Fore.WHITE)
     c("-" * 56, Fore.WHITE)
     c("免责声明: 本工具仅供个人学习使用；自动化抢购可能违反", Fore.YELLOW)
@@ -525,18 +545,13 @@ async def test_connect(region_id):
 
 
 async def test_order(region_id):
-    """测试下单：用服务器专区商品真实下单，会产生订单"""
+    """试单：preview=1 走真实校验链路，但不创建订单、不扣费"""
     if not await ensure_login():
         return
-    c("!" * 56, Fore.RED)
-    c("风险提示：测试下单会真实创建订单！", Fore.RED)
-    c("订单不付款会在 1 小时内自动关闭，也可到控制台手动取消", Fore.RED)
-    c("!" * 56, Fore.RED)
-    y = input("  确认测试下单？输入 YES 继续: ").strip()
-    if y != "YES":
-        c("  已取消", Fore.YELLOW)
-        return
-    goods = {**sf.TEST_GOODS, "goods_param": {**sf.TEST_GOODS["goods_param"], "regionId": region_id}}
+    c("=" * 56, Fore.CYAN)
+    c("  试单说明：preview=1 会真实走登录/参数/资格/时间窗校验，", Fore.WHITE)
+    c("  但不会创建订单、不会扣费，可反复使用。", Fore.WHITE)
+    c("=" * 56, Fore.CYAN)
     pw = None
     browser = None
     try:
@@ -550,18 +565,42 @@ async def test_order(region_id):
         await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(3)
         await _wait_csrf(page)
-        logged, _ = await _check_login(page)
+        logged, r = await _check_login(page)
         if not logged:
-            c("  登录态无效，需要重新扫码登录。", Fore.RED)
-        else:
-            c("  开始测试下单（服务器专区商品，持续5秒）...", Fore.CYAN)
-            success = await sf.rapid_purchase(page, goods, duration=5)
-            if success:
-                c("  测试下单成功（记得去控制台取消该订单）", Fore.GREEN)
+            c(f"  登录态无效（{r.get('code') or r.get('__err')}），先扫码登录再试。", Fore.RED)
+            return
+        c("  登录态: 有效", Fore.GREEN)
+
+        goods = {**sf.TEST_GOODS,
+                 "goods_param": {**sf.TEST_GOODS["goods_param"], "regionId": region_id}}
+        discover, session = await sf.discover_flash_sale(page, region_id)
+        c(f"  地域: {REGIONS.get(region_id, region_id)}", Fore.CYAN)
+        if session:
+            c(f"  最近场次: {session['start']} ~ {session['end']}", Fore.CYAN)
+
+        for tag, g in (("测试商品（109元首单款）", goods),
+                       ("正式秒杀商品（38元款）", discover)):
+            c(f"\n  --- {tag} ---", Fore.WHITE)
+            q = await sf.calc_quota(page, g)
+            if q:
+                c(f"  库存: 剩 {q.get('available')}/{q.get('total_num')}", Fore.WHITE)
+            out = await sf.probe_goods(page, g)
+            code = out.get("code")
+            msg = str(out.get("msg") or "")[:60]
+            if code == sf.CODE_OK:
+                c("  结果: 通过（可抢）", Fore.GREEN)
             else:
-                c("  测试完成（未下单成功，查看上方日志判断原因）", Fore.YELLOW)
+                desc = sf.CODE_DESC.get(code, "未知含义（建议截图反馈）")
+                color = Fore.GREEN if code == sf.CODE_NOT_STARTED else Fore.RED
+                c(f"  结果: code={code} {desc}", color)
+                if msg:
+                    c(f"  服务器原话: {msg}", Fore.WHITE)
+                if code == sf.CODE_NOT_STARTED:
+                    c("  说明: 时间窗问题（不在场次内），不是配置或账号问题", Fore.GREEN)
+                elif code == sf.CODE_ALREADY_BOUGHT:
+                    c("  说明: 该实名主体已买过这款首单商品，换账号才能验证", Fore.YELLOW)
     except Exception as e:
-        log(f"测试下单异常: {str(e)[:120]}")
+        log(f"试单异常: {str(e)[:120]}")
         return
     finally:
         if browser:
@@ -618,7 +657,10 @@ def main():
             break
         else:
             c("  无效选项", Fore.RED)
-        input("\n按回车继续...")
+        try:
+            input("\n按回车继续...")
+        except (EOFError, KeyboardInterrupt):
+            break
     c("再见！", Fore.YELLOW)
 
 

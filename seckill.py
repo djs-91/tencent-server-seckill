@@ -33,49 +33,60 @@ except ImportError:
 # 配置
 # ============================================================
 
-ACTIVITY_URL = "https://cloud.tencent.com/act/pro/featured-202607"
+# 活动页。腾讯换活动只换 slug（比如 .../double11-202611），改这一行就够；
+# 活动 id 和商品 id 都会从接口现查，不再写死在代码里。
+ACTIVITY_URL = "https://cloud.tencent.com/act/pro/double11-202611"
 
 # API 地址
-DO_GOODS_URL = "https://act-api.cloud.tencent.com/dianshi/do-goods"
+API_BASE = "https://act-api.cloud.tencent.com"
+DO_GOODS_URL = API_BASE + "/dianshi/do-goods"
 
-# 抢购商品
+# 兜底活动 id（自动发现失败时才用）。新的排前面，老的留作回落。
+#   166111704417621 = 2026年双十一主会场，2026-10-13 ~ 2026-11-30
+#   164461404341040 = 2026年7月日常大促，2026-06-30 ~ 2026-10-30（到期后自动跳过）
+CANDIDATE_ACTIVITY_IDS = [166111704417621, 164461404341040]
+
+# 轻量 4核4G3M 的通用购买参数（regionId 由用户选的地域覆盖）
+GOODS_PARAM = {
+    "BlueprintId": "LINUX_UNIX",
+    "area": 1,
+    "ddocUnionConnect": 0,
+    "goodsNum": 1,
+    "imageId": "lhbp-eqora508",
+    "scenario": "0",
+    "timeSpanUnit": "12m",
+    "zone": "",
+    "regionId": 8,  # 地域: 4=上海 8=北京 1=广州 (area=1 内地)
+    "type": "bundle_budget_mc_lg4_01",
+}
+
+# 抢购商品：轻量4核4G3M 38元/年（原价780元）
 FLASH_SALE = {
+    "act_id": 1996855673581677,
+    "activity_id": 166111704417621,
+    "type": "lighthouse_v5",
+    "name": "轻量4核4G3M (38元/年)",
+    "goods_param": dict(GOODS_PARAM),
+}
+
+# 老活动里的同一款商品（38元/年），2026-10-30 23:59:59 到期，仅作回落
+FLASH_SALE_LEGACY = {
     "act_id": 1897632168296710,
     "activity_id": 164461404341040,
     "type": "lighthouse_v5",
-    "name": "轻量4核4G3M (38元/年)",
-    "goods_param": {
-        "BlueprintId": "LINUX_UNIX",
-        "area": 1,
-        "ddocUnionConnect": 0,
-        "goodsNum": 1,
-        "imageId": "lhbp-eqora508",
-        "scenario": "0",
-        "timeSpanUnit": "12m",
-        "zone": "",
-        "regionId": 8,  # 地域: 4=上海 8=北京 1=广州 (area=1 内地)
-        "type": "bundle_budget_mc_lg4_01",
-    },
+    "name": "轻量4核4G3M (38元/年·老活动)",
+    "goods_param": dict(GOODS_PARAM),
 }
 
-# 测试商品 (服务器专区)
+# 试单商品：轻量4核4G3M 109元/年（服务器专区），不受秒杀时间窗限制，随时能验
+# 注意：它和 38 元那款是同一个「首单」SKU。买过任意一个，另一个也会返回
+# 1100106「已购买此产品」—— 那是账号状态，不是程序出错。
 TEST_GOODS = {
-    "act_id": 1865957483429697,
-    "activity_id": 164461404341040,
+    "act_id": 1978929380263448,
+    "activity_id": 166111704417621,
     "type": "lighthouse_v5",
-    "name": "轻量4核4G3M (服务器专区)",
-    "goods_param": {
-        "BlueprintId": "LINUX_UNIX",
-        "area": 1,
-        "ddocUnionConnect": 0,
-        "goodsNum": 1,
-        "imageId": "lhbp-eqora508",
-        "scenario": "0",
-        "timeSpanUnit": "12m",
-        "zone": "",
-        "regionId": 8,  # 地域: 4=上海 8=北京 1=广州 (area=1 内地)
-        "type": "bundle_budget_mc_lg4_01",
-    },
+    "name": "轻量4核4G3M (109元/年·专区)",
+    "goods_param": dict(GOODS_PARAM),
 }
 
 SECKILL_TIMES = ["10:00", "15:00"]
@@ -89,8 +100,27 @@ DURATION_SEC = 10
 # 每轮间隔 (毫秒)
 ROUND_INTERVAL_MS = 20
 
-# 提前多少毫秒开始发请求 (负数=提前，-3000=提前3秒)
-ADVANCE_MS = -3000
+# 提前多少毫秒开始发请求 (负数=提前，正数=延后)
+# 实测提前发只会拿到 1101001「秒杀尚未开始」——服务端按自己的时钟判窗口，
+# 所以默认 0（准点开火）。想激进一点可以 -200，再大就是白送请求。
+ADVANCE_MS = 0
+
+# ---- do-goods 业务返回码 ----
+CODE_OK = 0
+CODE_NOT_STARTED = 1101001     # 秒杀尚未开始（没到点 / 本场已结束）
+CODE_ALREADY_BOUGHT = 1100106  # 已购买此产品，不满足首单条件
+CODE_NO_QUALIFY = 1100107      # 不满足活动参与条件
+CODE_BAD_PARAM = 1100109       # 商品可选参数不对
+
+# 这几个重试没有意义，命中就停，别浪费窗口
+NO_RETRY_CODES = {CODE_ALREADY_BOUGHT, CODE_NO_QUALIFY, CODE_BAD_PARAM}
+
+CODE_DESC = {
+    CODE_NOT_STARTED: "秒杀尚未开始（未到时间或本场已结束）",
+    CODE_ALREADY_BOUGHT: "该实名主体已买过这款首单商品，不满足首单条件",
+    CODE_NO_QUALIFY: "账号不满足本活动参与条件",
+    CODE_BAD_PARAM: "商品参数不对（商品的规格约束变了）",
+}
 
 # 提前多少秒开始预热连接 (在目标时间前)
 WARMUP_SECONDS = 10
@@ -272,58 +302,199 @@ async def sync_time(page):
     return offset
 
 
-async def api_do_goods(page, goods, attempt):
-    """在浏览器上下文中调用 do-goods API（evaluate 异常不炸预热/抢购流程）"""
-    try:
-        result = await page.evaluate("""
-            async (params) => {
-                try {
-                    const resp = await fetch(params.url, {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json', 'x-csrf-token': window.__latestCsrf || ''},
-                        credentials: 'include',
-                        body: JSON.stringify({
-                            activity_id: params.activity_id,
-                            goods: [{act_id: params.act_id, type: params.type, goods_param: params.goods_param}],
-                            agent_channel: {fromChannel: '', fromSales: '', fromUrl: '', isAgentClient: false},
-                            preview: 0,
-                        }),
-                    });
-                    return await resp.json();
-                } catch(e) {
-                    return {code: -1, msg: e.message};
-                }
+async def api_post(page, path, body):
+    """在页面上下文里 POST act-api：cookie / CSRF / 同源都交给浏览器"""
+    return await page.evaluate("""
+        async (p) => {
+            try {
+                const r = await fetch(p.url, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json',
+                              'x-csrf-token': window.__latestCsrf || ''},
+                    credentials: 'include',
+                    body: JSON.stringify(p.body),
+                });
+                return await r.json();
+            } catch (e) {
+                return {code: -1, msg: String((e && e.message) || e)};
             }
-        """, {
-            "url": DO_GOODS_URL,
-            "activity_id": goods["activity_id"],
-            "act_id": goods["act_id"],
-            "type": goods["type"],
-            "goods_param": goods.get("goods_param", {}),
+        }
+    """, {"url": API_BASE + path, "body": body})
+
+
+async def discover_activity_id(page):
+    """从活动页自身内嵌的数据里读当前活动 id（腾讯换活动时这里会跟着变）"""
+    try:
+        aid = await page.evaluate("""
+            () => {
+                const html = document.documentElement.innerHTML;
+                let m = html.match(/"big_activity_id"\\s*:\\s*"?(\\d{12,20})"?/);
+                if (m) return Number(m[1]);
+                m = html.match(/"activity_id"\\s*:\\s*(\\d{12,20})/);
+                return m ? Number(m[1]) : 0;
+            }
+        """)
+        return int(aid) if aid else 0
+    except Exception as e:
+        log(f"读取活动 id 失败: {str(e)[:60]}")
+        return 0
+
+
+def _is_lighthouse(sale):
+    """场次里的 sales 是不是轻量应用服务器那条"""
+    if (sale.get("product_name") or "") == "lighthouse_v5":
+        return True
+    return "轻量" in (sale.get("goods_name") or "")
+
+
+async def discover_flash_sale(page, region_id=8):
+    """开抢前现查：当前在售场次 + 对应的 act_id / activity_id
+
+    腾讯每次换活动都会换 act_id，写死在代码里必然过期（换来的是 1101001）。
+    这个接口不需要签名，登录后就能调。拿不到才回落到代码里的兜底值。
+    返回 (goods, session)，session 为 None 表示用的是兜底值。
+    """
+    candidates = []
+    aid = await discover_activity_id(page)
+    if aid:
+        candidates.append(aid)
+    for a in CANDIDATE_ACTIVITY_IDS:
+        if a not in candidates:
+            candidates.append(a)
+
+    now = time.time()
+    for act in candidates:
+        r = await api_post(page, "/dianshi/query-seckill-by-date", {
+            "activity_id": act, "preview": 0, "seckill_type": "block",
+            "goods_type": "goods", "days": 7,
         })
+        if r.get("code") != CODE_OK:
+            log(f"  活动 {act}: 查不到场次 (code={r.get('code')})")
+            continue
+
+        upcoming, past = [], []
+        for date_str, day in ((r.get("data") or {}).get("flashResult") or {}).items():
+            for s in (day or []):
+                try:
+                    start = datetime.strptime(
+                        f"{date_str} {s.get('start_time')}", "%Y-%m-%d %H:%M:%S")
+                except (ValueError, TypeError):
+                    continue
+                (upcoming if start.timestamp() > now else past).append((date_str, s, start))
+        upcoming.sort(key=lambda x: x[2])
+        past.sort(key=lambda x: x[2])
+
+        for date_str, s, start in (upcoming[:1] or past[-1:]):
+            for sale in (s.get("sales") or []):
+                if not _is_lighthouse(sale):
+                    continue
+                goods = {
+                    "act_id": int(sale["act_id"]),
+                    "activity_id": int(act),
+                    "type": sale.get("product_name") or "lighthouse_v5",
+                    "name": "轻量4核4G3M (38元/年)",
+                    "goods_param": {**GOODS_PARAM, "regionId": region_id},
+                }
+                session = {
+                    "id": s.get("id"),
+                    "start": start.strftime("%Y-%m-%d %H:%M:%S"),
+                    "end": f"{date_str} {s.get('end_time')}",
+                    "started": start.timestamp() <= now,
+                }
+                return goods, session
+
+    log("自动发现失败，使用代码里的兜底 id（可能已过期，会返回 1101001）")
+    log("  排查：1) 活动页是否换了地址 → 改 ACTIVITY_URL")
+    log("        2) 是否已换新活动 → 把新 activity_id 加进 CANDIDATE_ACTIVITY_IDS")
+    fallback = {**FLASH_SALE, "goods_param": {**FLASH_SALE["goods_param"], "regionId": region_id}}
+    return fallback, None
+
+
+async def calc_quota(page, goods):
+    """查库存（只读）。注意这个接口不吃 activity_id，只吃 goods_id_list"""
+    r = await api_post(page, "/dianshi/calc-goods-quota",
+                       {"goods_id_list": [int(goods["act_id"])]})
+    if r.get("code") != CODE_OK:
+        return None
+    lst = ((r.get("data") or {}).get("goods_quota_list") or [])
+    return lst[0] if lst else None
+
+
+async def do_goods_raw(page, goods, preview=0, concurrency=1):
+    """调 do-goods。preview=1 是试单：服务端完整校验，但不产生订单。
+    返回 list（并发时有多条）。"""
+    result = await page.evaluate("""
+        async (params) => {
+            const one = () => fetch(params.url, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json',
+                          'x-csrf-token': window.__latestCsrf || ''},
+                credentials: 'include',
+                body: JSON.stringify({
+                    activity_id: params.activity_id,
+                    goods: [{act_id: params.act_id, type: params.type,
+                             goods_param: params.goods_param}],
+                    agent_channel: {fromChannel: '', fromSales: '', fromUrl: '',
+                                    isAgentClient: false},
+                    preview: params.preview,
+                }),
+            }).then(r => r.json()).catch(e => ({code: -1, msg: String((e && e.message) || e)}));
+
+            const jobs = [];
+            for (let i = 0; i < params.concurrency; i++) jobs.push(one());
+            return await Promise.all(jobs);
+        }
+    """, {
+        "url": DO_GOODS_URL,
+        "activity_id": goods["activity_id"],
+        "act_id": goods["act_id"],
+        "type": goods["type"],
+        "goods_param": goods.get("goods_param", {}),
+        "preview": int(preview),
+        "concurrency": int(concurrency),
+    })
+    if isinstance(result, dict):
+        return [result]
+    return result or []
+
+
+async def probe_goods(page, goods):
+    """preview=1 试单：真实走一遍服务端校验，但不产生订单。返回原始返回体。"""
+    results = await do_goods_raw(page, goods, preview=1, concurrency=1)
+    return results[0] if results else {"code": -1, "msg": "无返回"}
+
+
+async def api_do_goods(page, goods, attempt, preview=0):
+    """单发一次 do-goods，把返回码翻译成人话"""
+    try:
+        results = await do_goods_raw(page, goods, preview=preview, concurrency=1)
     except Exception as e:
         log(f"  do-goods 请求异常: {str(e)[:80]}")
         return False
 
+    result = results[0] if results else {"code": -1}
     code = result.get("code")
     msg = result.get("msg", "")
 
-    if code == 0:
+    if code == CODE_OK:
         deal = result.get("data", {})
         log(f"下单成功 #{attempt}")
         log(f"   订单号: {(deal.get('deal_names') or ['?'])[0]}")
         log(f"   大单号: {deal.get('big_deal_no') or '?'}")
         return True
-    elif attempt <= 5 or code != 1435936:
-        if attempt <= 10:
-            log(f"  #{attempt} code={code} msg={msg[:60]}")
+
+    if code in CODE_DESC:
+        log(f"  #{attempt} code={code} {CODE_DESC[code]}")
+    elif attempt <= 10 and code != 1435936:
+        log(f"  #{attempt} code={code} msg={msg[:60]}")
     return False
 
 
 async def warmup(page, goods):
-    """预热连接：提前发一个请求建立TCP/TLS，到点直接用"""
+    """预热连接：提前发一个「试单」把 TCP/TLS 建好，到点直接用。
+    用 preview=1，不会真的下单。"""
     log("预热连接...")
-    result = await api_do_goods(page, goods, 0)
+    result = await api_do_goods(page, goods, 0, preview=1)
     log(f"  预热完成 (结果: {'成功' if result else '未到时间，正常'})")
 
 
@@ -335,42 +506,14 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
     attempt = 0
     success = False
     err_count = 0
+    last_code = None
 
     while time.monotonic() - start < duration:
         # 批量发起：一次 evaluate 发 CONCURRENCY 个并发 fetch
         # evaluate 可能撞页面导航/关闭抛错，单轮失败不中断整个抢购窗口
         try:
-            batch_result = await page.evaluate("""
-                async (params) => {
-                    const results = [];
-                    const promises = [];
-                    for (let i = 0; i < params.concurrency; i++) {
-                        promises.push(
-                            fetch(params.url, {
-                                method: 'POST',
-                                headers: {'Content-Type': 'application/json', 'x-csrf-token': window.__latestCsrf || ''},
-                                credentials: 'include',
-                                body: JSON.stringify({
-                                    activity_id: params.activity_id,
-                                    goods: [{act_id: params.act_id, type: params.type, goods_param: params.goods_param}],
-                                    agent_channel: {fromChannel: '', fromSales: '', fromUrl: '', isAgentClient: false},
-                                    preview: 0,
-                                }),
-                            })
-                            .then(r => r.json())
-                            .catch(e => ({code: -1, msg: e.message}))
-                        );
-                    }
-                    return await Promise.all(promises);
-                }
-            """, {
-                "url": DO_GOODS_URL,
-                "activity_id": goods["activity_id"],
-                "act_id": goods["act_id"],
-                "type": goods["type"],
-                "goods_param": goods.get("goods_param", {}),
-                "concurrency": CONCURRENCY,
-            })
+            # 真抢：preview=0，会真的下单
+            batch_result = await do_goods_raw(page, goods, preview=0, concurrency=CONCURRENCY)
         except Exception as e:
             err_count += 1
             if err_count <= 3:
@@ -381,17 +524,25 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
         attempt += CONCURRENCY
 
         # 检查结果
+        fatal = False
         for r in batch_result:
             code = r.get("code")
-            if code == 0:
+            if code is not None:
+                last_code = code
+            if code == CODE_OK:
                 deal = r.get("data", {})
                 log("下单成功")
                 log(f"   订单号: {(deal.get('deal_names') or ['?'])[0]}")
                 log(f"   大单号: {deal.get('big_deal_no') or '?'}")
                 success = True
                 break
+            if code in NO_RETRY_CODES:
+                log(f"  返回 {code}: {CODE_DESC.get(code, r.get('msg', ''))}")
+                log("  这类错误重试没有意义，本场停止。")
+                fatal = True
+                break
 
-        if success:
+        if success or fatal:
             break
 
         if attempt % (CONCURRENCY * 20) == 0:
@@ -402,6 +553,14 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
 
     elapsed = time.monotonic() - start
     log(f"抢购结束: {attempt} 次请求, {elapsed:.1f}s, {'成功' if success else '未抢到'}")
+    if not success and last_code is not None:
+        hint = CODE_DESC.get(last_code)
+        if hint:
+            log(f"  最后返回码 {last_code}: {hint}")
+        elif last_code == -1:
+            log("  最后返回码 -1: 请求本身没发出去（网络/页面上下文问题）")
+        else:
+            log(f"  最后返回码 {last_code}: 未知含义，建议截图反馈")
     return success
 
 
@@ -460,8 +619,9 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
         # 同步时间
         offset_ms = await sync_time(page)
 
+        # 商品：测试模式用专区商品，正常模式用自动发现的秒杀商品
         goods = TEST_GOODS if test_mode else FLASH_SALE
-        log(f"商品: {goods['name']}")
+        log(f"商品(初始): {goods['name']}")
 
         # 等待前端 CSRF token 就绪（页面导航期间 evaluate 会报上下文销毁，吞掉重试）
         for _ in range(50):
@@ -474,13 +634,35 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
         else:
             log("未捕获到 CSRF token，请求可能失败")
 
+        # 现查当前在售场次与商品 id（腾讯换了活动也能自动跟上，不用改代码）
+        region_id = goods["goods_param"].get("regionId", 8)
+        if not test_mode:
+            found, session = await discover_flash_sale(page, region_id)
+            if session:
+                log(f"活动 {found['activity_id']} | 场次 {session['start']} ~ "
+                    f"{session['end']} (id={session['id']})")
+            goods = found
+            log(f"商品: {goods['name']} act_id={goods['act_id']} "
+                f"activity_id={goods['activity_id']}")
+            quota = await calc_quota(page, goods)
+            if quota:
+                log(f"库存: 剩 {quota.get('available')}/{quota.get('total_num')}")
+        else:
+            log(f"试单商品: {goods['name']} act_id={goods['act_id']}")
+
         if test_mode:
-            log("测试模式: 直接调用 do-goods")
-            success = await rapid_purchase(page, goods, duration=5)
-            if success:
-                log("测试成功，API 格式正确")
-            else:
-                log("测试完成。查看返回的 code 判断格式是否正确。")
+            log("测试模式: preview=1 试单（真实走一遍校验，不会下单）")
+            r = await probe_goods(page, goods)
+            code = r.get("code")
+            log(f"返回 code={code} msg={str(r.get('msg'))[:80]}")
+            if code == CODE_OK:
+                log("试单通过：登录、参数、资格全 OK，可以开抢")
+            elif code in CODE_DESC:
+                log(f"含义: {CODE_DESC[code]}")
+                if code == CODE_NOT_STARTED:
+                    log("这是时间窗问题，不是配置问题 —— 到点再抢就行")
+                elif code == CODE_ALREADY_BOUGHT:
+                    log("这是账号状态：该实名主体已买过这款首单商品，换账号才能试")
             return
 
         # 等待抢购时间

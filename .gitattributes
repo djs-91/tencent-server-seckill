@@ -1,0 +1,16 @@
+# Windows batch files must stay CRLF on every checkout, regardless of the
+# contributor's core.autocrlf setting (LF-only .bat breaks cmd parsing).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Python / JSON / Markdown: normalize to LF in the repo, let each OS decide
+# its checkout form.
+*.py   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+
+# Never touch binary assets.
+*.png binary
+*.jpg binary
+*.ico binary
