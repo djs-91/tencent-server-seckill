@@ -16,8 +16,6 @@
 
 import asyncio
 import argparse
-import json
-import os
 import sys
 import time
 from datetime import datetime, timedelta
@@ -26,7 +24,7 @@ from pathlib import Path
 try:
     from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 except ImportError:
-    print("pip3 install playwright")
+    print("缺少 playwright，先执行： pip install playwright")
     sys.exit(1)
 
 # ============================================================
@@ -139,15 +137,24 @@ CODE_NOT_STARTED = 1101001     # 秒杀尚未开始（没到点 / 本场已结�
 CODE_ALREADY_BOUGHT = 1100106  # 已购买此产品，不满足首单条件
 CODE_NO_QUALIFY = 1100107      # 不满足活动参与条件
 CODE_BAD_PARAM = 1100109       # 商品可选参数不对
+CODE_RATE_LIMIT = 408          # 访问频率过快（开抢瞬间大家都快）
+CODE_BUSY = 1100205            # 系统繁忙（开抢瞬间服务端排队）
+CODE_CONCURRENT = 1100110      # 正在执行其他操作（同账号有单在提交）
 
 # 这几个重试没有意义，命中就停，别浪费窗口
 NO_RETRY_CODES = {CODE_ALREADY_BOUGHT, CODE_NO_QUALIFY, CODE_BAD_PARAM}
+
+# 开抢瞬间常见的排队信号：并发请求里有的排队、有的成功，继续就行
+QUEUE_CODES = {CODE_NOT_STARTED, CODE_RATE_LIMIT, CODE_BUSY, CODE_CONCURRENT}
 
 CODE_DESC = {
     CODE_NOT_STARTED: "秒杀尚未开始（未到时间或本场已结束）",
     CODE_ALREADY_BOUGHT: "该实名主体已买过这款首单商品，不满足首单条件",
     CODE_NO_QUALIFY: "账号不满足本活动参与条件",
     CODE_BAD_PARAM: "商品参数不对（商品的规格约束变了）",
+    CODE_RATE_LIMIT: "访问频率限制（开抢瞬间大家都在抢），继续",
+    CODE_BUSY: "系统繁忙（开抢瞬间排队），继续",
+    CODE_CONCURRENT: "同账号有订单正在处理，继续",
 }
 
 # 提前多少秒开始预热连接 (在目标时间前)
@@ -165,46 +172,7 @@ BROWSER_LABEL = {
     None: "playwright chromium",
 }
 
-BROWSER_PATHS = {
-    "win": {
-        "chrome": [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
-        ],
-        "msedge": [
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe",
-        ],
-    },
-    "darwin": {
-        "chrome": ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
-        "msedge": ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"],
-    },
-    "linux": {
-        "chrome": ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"],
-        "msedge": ["/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable"],
-    },
-}
-
 LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled", "--no-sandbox"]
-
-
-def detect_browser():
-    """看本机装了哪些浏览器，返回第一个找到的 channel。没找到返回 None。"""
-    plat = "win" if sys.platform.startswith("win") else (
-        "darwin" if sys.platform == "darwin" else "linux")
-    paths = BROWSER_PATHS.get(plat, {})
-
-    for channel in BROWSER_CHANNELS:
-        if channel is None:
-            continue
-        for p in paths.get(channel, []):
-            if Path(os.path.expandvars(p)).exists():
-                return channel
-
-    return None
 
 
 async def launch_browser(pw, headless=True, extra_args=None):
@@ -476,6 +444,8 @@ async def discover_flash_sale(page, region_id=8):
             # 拿不到价格就排到最后，不影响判断。
             cands = []
             for sale in sales:
+                if sale.get("act_id") is None:
+                    continue
                 typ = sale.get("product_name") or ""
                 goods = {
                     "act_id": int(sale["act_id"]),
@@ -487,6 +457,8 @@ async def discover_flash_sale(page, region_id=8):
                 price = await fetch_price(page, act, goods["act_id"], goods["type"], region_id)
                 cands.append((_rank_candidate(sale, price), goods, price, sale))
 
+            if not cands:
+                continue  # 这场没拿到任何商品，看下一场
             cands.sort(key=lambda c: c[0])
             rank, goods, price, _sale = cands[0]
             why = RANK_DESC.get(rank, "都没对上")
@@ -562,32 +534,6 @@ async def probe_goods(page, goods):
     return results[0] if results else {"code": -1, "msg": "无返回"}
 
 
-async def api_do_goods(page, goods, attempt, preview=0):
-    """单发一次 do-goods，把返回码翻译成人话"""
-    try:
-        results = await do_goods_raw(page, goods, preview=preview, concurrency=1)
-    except Exception as e:
-        log(f"  do-goods 请求异常: {str(e)[:80]}")
-        return False
-
-    result = results[0] if results else {"code": -1}
-    code = result.get("code")
-    msg = result.get("msg", "")
-
-    if code == CODE_OK:
-        deal = result.get("data", {})
-        log(f"下单成功 #{attempt}")
-        log(f"   订单号: {(deal.get('deal_names') or ['?'])[0]}")
-        log(f"   大单号: {deal.get('big_deal_no') or '?'}")
-        return True
-
-    if code in CODE_DESC:
-        log(f"  #{attempt} code={code} {CODE_DESC[code]}")
-    elif attempt <= 10 and code != 1435936:
-        log(f"  #{attempt} code={code} msg={msg[:60]}")
-    return False
-
-
 async def warmup(page, goods):
     """预热连接：提前发一个「预检请求」把 TCP/TLS 建好，到点直接用。
     用 preview=1，不会真的下单。返回服务端返回体，供上层判断是否需要中止。"""
@@ -599,8 +545,10 @@ async def warmup(page, goods):
     elif code in NO_RETRY_CODES:
         log(f"  预热返回 {code}: {CODE_DESC.get(code, '')}")
         log(f"  服务器原话: {str(result.get('msg') or '')[:70]}")
+    elif code == CODE_NOT_STARTED:
+        log("  预热完成（还没到场次时间，正常）")
     else:
-        log(f"  预热完成（code={code}，未到时间属正常）")
+        log(f"  预热完成（code={code}，{CODE_DESC.get(code, '排队信号，不影响')}）")
     return result
 
 
@@ -646,7 +594,7 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
             if code not in seen_codes:
                 # 同一种返回码只报一次，避免刷屏；但一定带上服务器的原话
                 seen_codes[code] = 1
-                log(f"  返回 {code}: {CODE_DESC.get(code, '未知含义（建议截图反馈）')}"
+                log(f"  返回 {code}: {CODE_DESC.get(code, '未知返回码，程序会继续，不影响')}"
                     f" | {str(r.get('msg') or '')[:60]}")
             if code in NO_RETRY_CODES:
                 log("  这类错误重试没有意义，本场停止。")
@@ -670,8 +618,11 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
             log(f"  最后返回码 {last_code}: {hint}")
         elif last_code == -1:
             log("  最后返回码 -1: 请求本身没发出去（网络/页面上下文问题）")
+        elif last_code in QUEUE_CODES:
+            log(f"  最后返回码 {last_code}: {CODE_DESC.get(last_code, '排队信号')}"
+                f"。这类码刷屏不影响抢购，没抢到就是名额没了或时间窗不对")
         else:
-            log(f"  最后返回码 {last_code}: 未知含义，建议截图反馈")
+            log(f"  最后返回码 {last_code}: 未知返回码，把这段日志发个 issue 就行")
     return success
 
 
@@ -686,7 +637,7 @@ def find_nearest_time(offset_ms=0):
     return datetime.strptime(f"{tomorrow} {SECKILL_TIMES[0]}", "%Y-%m-%d %H:%M")
 
 
-async def run(target_time=None, test_mode=False, loop_mode=False):
+async def run(target_time=None, test_mode=False):
     pw = await async_playwright().start()
     browser = await launch_browser(pw, headless=False)
 
@@ -818,7 +769,7 @@ async def run(target_time=None, test_mode=False, loop_mode=False):
                 warmed_up = True
                 probe = await warmup(page, goods)
                 if probe.get("code") in NO_RETRY_CODES:
-                    log("开抢前已知资格不满足，中止本场（不必空等）")
+                    log("开抢前已知资格不满足，中止本场")
                     return
 
             await asyncio.sleep(0.05 if remaining <= 5 else 1)
@@ -852,10 +803,9 @@ def main():
     parser.add_argument("--time", type=str, help="HH:MM")
     parser.add_argument("--test", action="store_true",
                         help="测试下单流程：用 109 元专区商品真下单（不付款，测完请及时取消）")
-    parser.add_argument("--loop", action="store_true", help="持续运行")
     args = parser.parse_args()
 
-    asyncio.run(run(target_time=args.time, test_mode=args.test, loop_mode=args.loop))
+    asyncio.run(run(target_time=args.time, test_mode=args.test))
 
 
 if __name__ == "__main__":

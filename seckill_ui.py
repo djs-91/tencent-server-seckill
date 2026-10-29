@@ -12,7 +12,6 @@
 """
 import asyncio
 import json
-import os
 import sys
 import time
 from datetime import datetime
@@ -61,19 +60,6 @@ def load_config():
 
 def save_config(cfg):
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def bark_push(title, body):
-    cfg = load_config()
-    key = cfg.get("bark_key", "").strip()
-    if not key:
-        return
-    try:
-        import requests
-        requests.post(f"https://api.day.app/{key}/{title}/{body}", timeout=5)
-        log("Bark 推送已发送")
-    except Exception as e:
-        log(f"Bark 推送失败: {e}")
 
 
 # ---------- 登录 ----------
@@ -365,6 +351,8 @@ async def run_grab(region_id, target_time=None):
             goods_box["goods"] = found
             log(f"商品: {found['name']} act_id={found['act_id']} "
                 f"activity_id={found['activity_id']}")
+            log(f"  价格: {sf.fmt_price(found.get('price'))}"
+                f"（{found.get('price_check', '未校验')}）")
 
         offset_ms = await sf.sync_time(page)
         await refresh_goods()
@@ -440,8 +428,12 @@ async def run_grab(region_id, target_time=None):
                 log(f"  还剩 {remaining/60:.0f}min")
 
             if remaining <= sf.WARMUP_SECONDS and not warmed_up:
-                await sf.warmup(page, goods_box["goods"])
                 warmed_up = True
+                probe = await sf.warmup(page, goods_box["goods"])
+                if probe.get("code") in sf.NO_RETRY_CODES:
+                    stop_hb["v"] = True
+                    c("\n开抢前已知资格不满足，中止本场。", Fore.RED)
+                    return False
 
             await asyncio.sleep(0.05 if remaining <= 5 else 1)
 
@@ -479,7 +471,7 @@ def show_menu():
     c("=" * 56, Fore.YELLOW)
     c("        腾讯云服务器抢购助手", Fore.YELLOW + Style.BRIGHT)
     c("  活动: 上云精选·限时秒杀（轻量应用服务器，每天 10:00 / 15:00）", Fore.WHITE)
-    c("  商品 id 每期活动会变，程序启动时自动现查，无需手动改", Fore.WHITE)
+    c("  商品 id 每期活动会变，开始抢购时自动现查，无需手动改", Fore.WHITE)
     c("=" * 56, Fore.YELLOW)
     c(f"  服务器地域: {REGIONS.get(region, region)}", Fore.CYAN)
     c(f"  登录状态  : {'已保存(使用时自动校验)' if state_exists else '未登录'}", Fore.CYAN)
@@ -501,7 +493,7 @@ async def test_once(region_id):
     if not await ensure_login():
         return
     c("!" * 58, Fore.YELLOW)
-    c("  测试下单流程：拿 109 元专区商品真下单（preview=0），不付款。", Fore.WHITE)
+    c("  测试下单流程：用 109 元专区商品真下单（preview=0），不付款。", Fore.WHITE)
     c("  这个商品和 38 元那款配置一样，但不是同一个商品。", Fore.WHITE)
     c("  能确认：登录态、参数结构、首单资格、能不能建单。", Fore.WHITE)
     c("  不付款的订单 1 小时后自动关闭。抢之前去订单页取消掉。", Fore.YELLOW)
