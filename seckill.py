@@ -111,17 +111,16 @@ def fmt_price(price):
 
 SECKILL_TIMES = ["10:00", "15:00"]
 
-# 一轮同时发多少个请求。一次 evaluate 里一起发 N 个 fetch，等全部回来再发下一批，
-# 所以每秒条数 ≈ N ÷ 单条响应耗时。实测未登录时服务端 256ms 就回包，登录态走下单路径明显更慢
-# （按 issue 里的日志反推单轮约 2 秒，那份日志不完整，只当量级参考）。
-# 真相是：限流码回得越慢，一轮越久，能发的条数越少——加并发是唯一能放大的杠杆。
-CONCURRENCY = 30
+# 同时最多发多少个请求。不等这一批全回来，回来一个补一个，
+# 所以每秒能发多少跟单条响应快慢无关（旧做法一批发完等一批，单条 2 秒就只有 5 次/秒）。
+# 这个数不是本机发不动的限制——实测网关并发到 120 都没明显排队，是给服务端留点余量。
+INFLIGHT = 50
+
+# 隔多久看一次页面里攒下的返回结果（毫秒）。只影响多快发现成功，不影响发得多快。
+POLL_MS = 40
 
 # 持续发送时间 (秒)
 DURATION_SEC = 10
-
-# 每轮间隔 (毫秒)：一批请求回来后立即发下一批，不再空等
-ROUND_INTERVAL_MS = 0
 
 # 提前多少毫秒开始抢（负数=提前，相对按服务器时间算出的开抢时刻）
 #
@@ -592,70 +591,165 @@ async def warmup(page, goods):
     return result
 
 
+FIRE_JS = """
+(params) => {
+    const st = window.__sk || (window.__sk = {
+        inflight: 0, fired: 0, done: 0, codes: {}, msgs: {},
+        hit: null, fatal: null, stopped: false,
+    });
+    if (params.reset) {
+        st.inflight = 0; st.fired = 0; st.done = 0;
+        st.codes = {}; st.msgs = {};
+        st.hit = null; st.fatal = null; st.stopped = false;
+    }
+    if (params.stop) st.stopped = true;
+
+    const body = JSON.stringify({
+        activity_id: params.activity_id,
+        goods: [{act_id: params.act_id, type: params.type, goods_param: params.goods_param}],
+        agent_channel: {fromChannel: '', fromSales: '', fromUrl: '', isAgentClient: false},
+        preview: params.preview,
+    });
+
+    let n = 0;
+    while (n < params.batch && st.inflight < params.cap && !st.stopped && !st.hit && !st.fatal) {
+        st.inflight++; st.fired++; n++;
+        fetch(params.url, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json',
+                      'x-csrf-token': window.__latestCsrf || ''},
+            credentials: 'include',
+            body: body,
+        }).then(r => r.json()).then(d => {
+            st.inflight--; st.done++;
+            const c = d && d.code;
+            st.codes[c] = (st.codes[c] || 0) + 1;
+            if (d && d.msg) st.msgs[c] = String(d.msg).slice(0, 60);
+            if (c === params.ok && !st.hit) st.hit = d;
+            if (params.norety.indexOf(c) >= 0 && !st.fatal) st.fatal = c;
+        }).catch(e => {
+            st.inflight--; st.done++;
+            st.codes[-1] = (st.codes[-1] || 0) + 1;
+            if (!st.msgs[-1]) st.msgs[-1] = String((e && e.message) || e).slice(0, 60);
+        });
+    }
+    return {fired: st.fired, inflight: st.inflight, done: st.done,
+            codes: st.codes, msgs: st.msgs, hit: st.hit, fatal: st.fatal};
+}
+"""
+
+
 async def rapid_purchase(page, goods, duration=DURATION_SEC):
-    """并发调 API，每次 evaluate 发一批请求"""
-    log(f"开始抢购：并发={CONCURRENCY}，间隔={ROUND_INTERVAL_MS}ms，持续={duration}s")
+    """不等这一批全回来就发下一批：同时在等的到上限就停手，回来一个补一个。
+
+    每秒能发多少只看回来得多快，跟单条请求慢不慢无关；
+    成功和致命码从页面里攒下的返回结果读。
+    """
+    log(f"开始抢购：同时最多 {INFLIGHT} 条，每 {POLL_MS}ms 看一次结果，持续 {duration}s")
+
+    params = {
+        "url": DO_GOODS_URL,
+        "activity_id": goods["activity_id"],
+        "act_id": goods["act_id"],
+        "type": goods["type"],
+        "goods_param": goods.get("goods_param", {}),
+        "preview": 0,          # 真抢：会真的下单
+        "cap": int(INFLIGHT),
+        "batch": int(INFLIGHT),
+        "ok": CODE_OK,
+        "norety": sorted(NO_RETRY_CODES),
+        "reset": True,
+        "stop": False,
+    }
 
     start = time.monotonic()
-    attempt = 0
     success = False
-    err_count = 0
     last_code = None
     seen_codes = {}
+    fired = 0
+    err_count = 0
+    next_progress = start + 2
+    result = {}
 
     while time.monotonic() - start < duration:
-        # 批量发起：一次 evaluate 发 CONCURRENCY 个并发 fetch
-        # evaluate 可能撞页面导航/关闭抛错，单轮失败不中断整个抢购窗口
+        params["reset"] = False
         try:
-            # 真抢：preview=0，会真的下单
-            batch_result = await do_goods_raw(page, goods, preview=0, concurrency=CONCURRENCY)
+            result = await page.evaluate(FIRE_JS, params) or {}
         except Exception as e:
+            # evaluate 可能撞页面导航/关闭抛错，单次失败不中断整个窗口
             err_count += 1
             if err_count <= 3:
-                log(f"  本轮请求异常: {str(e)[:80]}")
-            await asyncio.sleep(ROUND_INTERVAL_MS / 1000)
+                log(f"  发射失败: {str(e)[:80]}")
+            await asyncio.sleep(POLL_MS / 1000)
             continue
 
-        attempt += CONCURRENCY
-
-        # 检查结果
-        fatal = False
-        for r in batch_result:
-            code = r.get("code")
-            if code is not None:
-                last_code = code
+        fired = int(result.get("fired") or 0)
+        msgs = result.get("msgs") or {}
+        for key, cnt in (result.get("codes") or {}).items():
+            try:
+                code = int(key)
+            except Exception:
+                code = key          # 登录态失效时返回的是字符串码，别吞掉
             if code == CODE_OK:
-                deal = r.get("data", {})
-                log("下单成功")
-                log(f"   订单号: {(deal.get('deal_names') or ['?'])[0]}")
-                log(f"   大单号: {deal.get('big_deal_no') or '?'}")
-                success = True
-                break
-            if code not in seen_codes:
-                # 同一种返回码只报一次，避免刷屏；但一定带上服务器的原话
-                seen_codes[code] = 1
-                log(f"  返回 {code}: {CODE_DESC.get(code, '未知返回码，程序会继续，不影响')}"
-                    f" | {str(r.get('msg') or '')[:60]}")
-            if code in NO_RETRY_CODES:
-                log("  这类错误重试没有意义，本场停止。")
-                fatal = True
-                break
+                continue            # 成功走下面的 hit 分支，不当作异常码打印
+            last_code = code
+            if code in seen_codes:
+                continue
+            # 同一种码只报一次，避免刷屏；但一定带上服务器的原话
+            seen_codes[code] = cnt
+            log(f"  返回 {code}: {CODE_DESC.get(code, '未知返回码，程序会继续，不影响')}"
+                f" | {msgs.get(key, '')}")
 
-        if success or fatal:
+        hit = result.get("hit")
+        if hit:
+            deal = hit.get("data") or {}
+            log("下单成功")
+            log(f"   订单号: {(deal.get('deal_names') or ['?'])[0]}")
+            log(f"   大单号: {deal.get('big_deal_no') or '?'}")
+            success = True
             break
 
-        if attempt % (CONCURRENCY * 20) == 0:
-            elapsed = time.monotonic() - start
-            log(f"  已尝试 {attempt} 次 ({elapsed:.1f}s)")
+        fatal = result.get("fatal")
+        if fatal is not None:
+            log("  这类错误重试没有意义，本场停止。")
+            last_code = fatal
+            break
 
-        await asyncio.sleep(ROUND_INTERVAL_MS / 1000)
+        now = time.monotonic()
+        if now >= next_progress:
+            next_progress = now + 2
+            log(f"  已发 {fired} 条，还在等 {int(result.get('inflight') or 0)} 条 "
+                f"({now - start:.1f}s)")
+
+        await asyncio.sleep(POLL_MS / 1000)
+
+    # 收尾：先让页面停发，再把还没回来的等一会儿，
+    # 免得最后半秒的成功返回被丢掉（数量由服务端按账号限 1，不会因为多发重复下单）
+    try:
+        params["stop"] = True
+        deadline = time.monotonic() + 2.5
+        while True:
+            result = await page.evaluate(FIRE_JS, params) or {}
+            if result.get("hit") and not success:
+                deal = (result["hit"].get("data") or {})
+                log("下单成功")
+                log(f"   订单号: {(deal.get('deal_names') or ['?'])[0]}")
+                log(f"   大单号: {(deal.get('big_deal_no') or '?')}")
+                success = True
+            if success or int(result.get("inflight") or 0) == 0 or time.monotonic() > deadline:
+                break
+            await asyncio.sleep(0.1)
+        fired = int(result.get("fired") or fired)
+    except Exception:
+        pass
 
     elapsed = time.monotonic() - start
-    log(f"抢购结束: {attempt} 次请求, {elapsed:.1f}s, {'成功' if success else '未抢到'}")
+    log(f"抢购结束: {fired} 次请求, {elapsed:.1f}s, {'成功' if success else '未抢到'}")
     if not success and last_code is not None:
-        hint = CODE_DESC.get(last_code)
-        if hint:
-            log(f"  最后返回码 {last_code}: {hint}")
+        if isinstance(last_code, str):
+            log(f"  最后返回码 {last_code}: 登录态校验没过，重新扫码登录再试")
+        elif CODE_DESC.get(last_code):
+            log(f"  最后返回码 {last_code}: {CODE_DESC[last_code]}")
         elif last_code == -1:
             log("  最后返回码 -1: 请求本身没发出去（网络/页面上下文问题）")
         elif last_code in QUEUE_CODES:
