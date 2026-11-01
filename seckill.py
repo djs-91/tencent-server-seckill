@@ -139,9 +139,11 @@ CODE_BAD_PARAM = 1100109       # 商品可选参数不对
 CODE_RATE_LIMIT = 408          # 访问频率过快（开抢瞬间大家都快）
 CODE_BUSY = 1100205            # 系统繁忙（开抢瞬间服务端排队）
 CODE_CONCURRENT = 1100110      # 正在执行其他操作（同账号有单在提交）
+CODE_SOLD_OUT = 1100136        # 当前商品已售罄（本场名额没了）
 
 # 这几个重试没有意义，命中就停，别浪费窗口
-NO_RETRY_CODES = {CODE_ALREADY_BOUGHT, CODE_NO_QUALIFY, CODE_BAD_PARAM}
+# 售罄也算：订单超过支付时限才回补，跟本场没关系，继续发只是白撞限流
+NO_RETRY_CODES = {CODE_ALREADY_BOUGHT, CODE_NO_QUALIFY, CODE_BAD_PARAM, CODE_SOLD_OUT}
 
 # 开抢瞬间常见的排队信号：并发请求里有的排队、有的成功，继续就行
 QUEUE_CODES = {CODE_NOT_STARTED, CODE_RATE_LIMIT, CODE_BUSY, CODE_CONCURRENT}
@@ -154,6 +156,8 @@ CODE_DESC = {
     CODE_RATE_LIMIT: "访问频率限制（开抢瞬间大家都在抢），继续",
     CODE_BUSY: "系统繁忙（开抢瞬间排队），继续",
     CODE_CONCURRENT: "同账号有订单正在处理，继续",
+    CODE_SOLD_OUT: "商品已售罄（本场名额已经没了）",
+    -1: "请求没发出去（网络断了或页面上下文没了）",
 }
 
 # 提前多少秒开始预热连接 (在目标时间前)
@@ -596,12 +600,12 @@ FIRE_JS = """
 (params) => {
     const st = window.__sk || (window.__sk = {
         inflight: 0, fired: 0, done: 0, codes: {}, msgs: {},
-        hit: null, fatal: null, stopped: false,
+        hit: null, fatal: null, stopped: false, last: null,
     });
     if (params.reset) {
         st.inflight = 0; st.fired = 0; st.done = 0;
         st.codes = {}; st.msgs = {};
-        st.hit = null; st.fatal = null; st.stopped = false;
+        st.hit = null; st.fatal = null; st.stopped = false; st.last = null;
     }
     if (params.stop) st.stopped = true;
 
@@ -624,28 +628,39 @@ FIRE_JS = """
         }).then(r => r.json()).then(d => {
             st.inflight--; st.done++;
             const c = d && d.code;
+            st.last = c;
             st.codes[c] = (st.codes[c] || 0) + 1;
             if (d && d.msg) st.msgs[c] = String(d.msg).slice(0, 60);
             if (c === params.ok && !st.hit) st.hit = d;
             if (params.norety.indexOf(c) >= 0 && !st.fatal) st.fatal = c;
         }).catch(e => {
             st.inflight--; st.done++;
+            st.last = -1;
             st.codes[-1] = (st.codes[-1] || 0) + 1;
             if (!st.msgs[-1]) st.msgs[-1] = String((e && e.message) || e).slice(0, 60);
         });
     }
     return {fired: st.fired, inflight: st.inflight, done: st.done,
-            codes: st.codes, msgs: st.msgs, hit: st.hit, fatal: st.fatal};
+            codes: st.codes, msgs: st.msgs, hit: st.hit, fatal: st.fatal,
+            last: st.last};
 }
 """
 
 
-async def rapid_purchase(page, goods, duration=DURATION_SEC):
+async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
     """不等这一批全回来就发下一批：同时在等的到上限就停手，回来一个补一个。
 
     每秒能发多少只看回来得多快，跟单条请求慢不慢无关；
     成功和致命码从页面里攒下的返回结果读。
+
+    open_in：距离场次开窗还有多少秒（None=没有窗口概念，直接全速）。
+    提前的那段时间只留一条探针，别把限流额度耗在开窗之前。
     """
+    open_at = None if open_in is None else time.monotonic() + open_in
+    # 已经在窗口里（比如手动抢一场进行中的）就不用探针，直接全速
+    ramped = open_at is None or open_in <= 0
+    if not ramped:
+        log(f"距开窗 {open_in:.1f}s，先只发一条探针，到点再全速")
     log(f"开始抢购：同时最多 {INFLIGHT} 条，每 {POLL_MS}ms 看一次结果，持续 {duration}s")
 
     params = {
@@ -673,6 +688,14 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
     result = {}
 
     while time.monotonic() - start < duration:
+        if not ramped and time.monotonic() >= open_at:
+            ramped = True
+            params["cap"] = int(INFLIGHT)
+            params["batch"] = int(INFLIGHT)
+            log("  开窗了，全速发")
+        elif not ramped:
+            params["cap"] = 1
+            params["batch"] = 1
         params["reset"] = False
         try:
             result = await page.evaluate(FIRE_JS, params) or {}
@@ -693,13 +716,16 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
                 code = key          # 登录态失效时返回的是字符串码，别吞掉
             if code == CODE_OK:
                 continue            # 成功走下面的 hit 分支，不当作异常码打印
-            last_code = code
             if code in seen_codes:
                 continue
             # 同一种码只报一次，避免刷屏；但一定带上服务器的原话
             seen_codes[code] = cnt
             log(f"  返回 {code}: {CODE_DESC.get(code, '未知返回码，程序会继续，不影响')}"
                 f" | {msgs.get(key, '')}")
+
+        # 「最后返回码」取最新回来那一条，不是随便挑一个（同时有多条在路上时，回来的顺序是乱的）
+        if result.get("last") is not None:
+            last_code = result["last"]
 
         hit = result.get("hit")
         if hit:
@@ -712,15 +738,21 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
 
         fatal = result.get("fatal")
         if fatal is not None:
-            log("  这类错误重试没有意义，本场停止。")
+            if fatal == CODE_SOLD_OUT:
+                log("  商品已售罄，本场没有名额了，停止。")
+            elif fatal in (CODE_ALREADY_BOUGHT, CODE_NO_QUALIFY):
+                log(f"  账号这边过不去（{CODE_DESC.get(fatal, '')}），本场停止。")
+            else:
+                log("  这类错误重试没有意义，本场停止。")
             last_code = fatal
             break
 
         now = time.monotonic()
         if now >= next_progress:
             next_progress = now + 2
-            log(f"  已发 {fired} 条，还在等 {int(result.get('inflight') or 0)} 条 "
-                f"({now - start:.1f}s)")
+            rate = fired / max(0.001, now - start)
+            log(f"  已发 {fired} 条（{rate:.0f}/秒），"
+                f"还在等 {int(result.get('inflight') or 0)} 条 ({now - start:.1f}s)")
 
         await asyncio.sleep(POLL_MS / 1000)
 
@@ -746,9 +778,25 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC):
 
     elapsed = time.monotonic() - start
     log(f"抢购结束: {fired} 次请求, {elapsed:.1f}s, {'成功' if success else '未抢到'}")
+    tally = result.get("codes") or {}
+    if tally:
+        def _label(k):
+            try:
+                k = int(k)          # 页面里回来的字典键是字符串
+            except Exception:
+                pass
+            if k == CODE_OK:
+                return "成功"
+            if k == -1:
+                return "没发出去"
+            return str(k)
+        parts = sorted(tally.items(), key=lambda kv: -kv[1])
+        log("  各码次数: " + ", ".join(f"{_label(k)}×{v}" for k, v in parts))
     if not success and last_code is not None:
         if isinstance(last_code, str):
             log(f"  最后返回码 {last_code}: 登录态校验没过，重新扫码登录再试")
+        elif last_code == CODE_SOLD_OUT:
+            log(f"  最后返回码 {last_code}: {CODE_DESC[last_code]}，只能等下一场")
         elif CODE_DESC.get(last_code):
             log(f"  最后返回码 {last_code}: {CODE_DESC[last_code]}")
         elif last_code == -1:
@@ -908,7 +956,10 @@ async def run(target_time=None, test_mode=False):
                 warmed_up = True
                 probe = await warmup(page, goods)
                 if probe.get("code") in NO_RETRY_CODES:
-                    log("开抢前已知资格不满足，中止本场")
+                    if probe.get("code") == CODE_SOLD_OUT:
+                        log("开抢前这个商品就已经售罄了，中止本场")
+                    else:
+                        log("开抢前已知资格不满足，中止本场")
                     return
                 continue
 
@@ -918,7 +969,8 @@ async def run(target_time=None, test_mode=False):
             await asyncio.sleep(min(1.0, max(0.05, remaining - QUIET_SECONDS)))
 
         # 执行抢购
-        success = await rapid_purchase(page, goods)
+        open_in = (target_ms - (time.time() * 1000 + offset_ms)) / 1000
+        success = await rapid_purchase(page, goods, open_in=open_in)
 
         if success:
             log("抢购成功，请在浏览器中完成支付")

@@ -445,7 +445,10 @@ async def run_grab(region_id, target_time=None):
                 probe = await sf.warmup(page, goods_box["goods"])
                 if probe.get("code") in sf.NO_RETRY_CODES:
                     stop_hb["v"] = True
-                    c("\n开抢前已知资格不满足，中止本场。", Fore.RED)
+                    if probe.get("code") == sf.CODE_SOLD_OUT:
+                        c("\n开抢前这个商品就已经售罄了，中止本场。", Fore.RED)
+                    else:
+                        c("\n开抢前已知资格不满足，中止本场。", Fore.RED)
                     return False
                 continue
 
@@ -454,7 +457,8 @@ async def run_grab(region_id, target_time=None):
 
             await asyncio.sleep(min(1.0, max(0.05, remaining - sf.QUIET_SECONDS)))
 
-        success = await sf.rapid_purchase(page, goods_box["goods"])
+        open_in = (target_ms - (time.time() * 1000 + offset_ms)) / 1000
+        success = await sf.rapid_purchase(page, goods_box["goods"], open_in=open_in)
         stop_hb["v"] = True
         if success:
             c("\n" + "=" * 40, Fore.GREEN)
