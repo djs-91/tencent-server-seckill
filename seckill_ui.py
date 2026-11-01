@@ -40,8 +40,13 @@ VIP_URL = "https://act-api.cloud.tencent.com/user/get-vip-info"
 
 
 # ---------- 基础工具 ----------
+# 心跳行宽度：打印正式日志前先擦掉这一行，否则会和日志叠在同一行
+HB_WIDTH = 72
+
+
 def log(msg):
-    ts = datetime.now().strftime("%H:%M:%S")
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    sys.stdout.write("\r" + " " * HB_WIDTH + "\r")
     print(f"[{ts}] {msg}")
     with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(f"[{datetime.now().isoformat()}] {msg}\n")
@@ -301,7 +306,7 @@ async def run_grab(region_id, target_time=None):
                 alive = browser.is_connected()
             except Exception:
                 alive = False
-            sys.stdout.write(f"\r浏览器状态: {'运行中' if alive else '已关闭'} | Ctrl+C 停止    ")
+            sys.stdout.write(("\r浏览器状态: %s | Ctrl+C 停止" % ("运行中" if alive else "已关闭")).ljust(HB_WIDTH))
             sys.stdout.flush()
             time.sleep(5)
     import threading
@@ -367,6 +372,10 @@ async def run_grab(region_id, target_time=None):
         wait_sec = (target_dt - now).total_seconds()
         log(f"目标: {target_dt.strftime('%Y-%m-%d %H:%M:%S')} (服务器时间)")
         log(f"等待 {wait_sec:.0f}s ({wait_sec/60:.1f}min)")
+        log(f"提前量 {abs(sf.ADVANCE_MS)}ms")
+
+        target_ms = target_dt.timestamp() * 1000
+        fire_local_ms = target_ms + sf.ADVANCE_MS - offset_ms   # 开始抢的时刻换算成本机时间
 
         warmed_up = False
         resynced = False
@@ -374,14 +383,26 @@ async def run_grab(region_id, target_time=None):
             if not browser.is_connected():
                 c("\n浏览器已被关闭，程序中止。", Fore.RED)
                 return False
-            now_ms = int(time.time() * 1000) + offset_ms
-            remaining = (target_dt.timestamp() * 1000 - now_ms) / 1000
+            remaining = (target_ms - (time.time() * 1000 + offset_ms)) / 1000
+
+            # 最后 QUIET_SECONDS 秒只等待：对时、刷新页面、预热都要等网络，
+            # 压在最后几秒会把提前量吃掉，所以这段时间一次网络请求都不发。
+            if remaining <= sf.QUIET_SECONDS:
+                log(f"最后 {remaining:.1f}s，只等待不发请求")
+                gap = fire_local_ms - time.time() * 1000
+                if gap > 0:
+                    await asyncio.sleep(gap / 1000)
+                left = target_ms - (time.time() * 1000 + offset_ms)
+                log(f"实际提前 {left:.0f}ms（设定 {abs(sf.ADVANCE_MS)}ms，"
+                    f"偏差 {left - abs(sf.ADVANCE_MS):+.0f}ms）")
+                break
 
             # 剩余 3 分钟：刷新页面 + 复验登录 + 重新对时。
             # 挂机数小时的会话，CSRF token / 登录态都可能过期，
             # 开抢前必须让页面重新生成 token，并确认登录仍然有效。
+            # 这一步必须在进纯等待之前做完，来不及就跳过刷新，不占提前量。
             if remaining <= 180 and not resynced:
-                if remaining > 60:
+                if remaining > sf.WARMUP_SECONDS:
                     log("剩余3分钟，刷新页面并重新对时...")
                     csrf_ok = False
                     for attempt in (1, 2):
@@ -409,23 +430,15 @@ async def run_grab(region_id, target_time=None):
                     else:
                         c("!! 刷新后仍未捕获到 CSRF token，开抢可能失败，请留意", Fore.RED)
                 else:
-                    log("临近开抢（不足60秒），跳过页面刷新，只重新对时...")
+                    log("临近开抢，跳过页面刷新，只重新对时...")
                 offset_ms = await sf.sync_time(page)
+                fire_local_ms = target_ms + sf.ADVANCE_MS - offset_ms
                 try:
                     await refresh_goods()
                 except Exception as e:
                     log(f"重新拉取场次失败（沿用上次结果）: {str(e)[:80]}")
                 resynced = True
                 continue
-
-            if remaining * 1000 <= -sf.ADVANCE_MS:
-                log(f"提前 {abs(sf.ADVANCE_MS)}ms 开始")
-                break
-
-            if remaining <= 10:
-                log(f"{remaining:.1f}s")
-            elif int(remaining) % 60 == 0:
-                log(f"  还剩 {remaining/60:.0f}min")
 
             if remaining <= sf.WARMUP_SECONDS and not warmed_up:
                 warmed_up = True
@@ -434,8 +447,12 @@ async def run_grab(region_id, target_time=None):
                     stop_hb["v"] = True
                     c("\n开抢前已知资格不满足，中止本场。", Fore.RED)
                     return False
+                continue
 
-            await asyncio.sleep(0.05 if remaining <= 5 else 1)
+            if int(remaining) % 60 == 0:
+                log(f"  还剩 {remaining/60:.0f}min")
+
+            await asyncio.sleep(min(1.0, max(0.05, remaining - sf.QUIET_SECONDS)))
 
         success = await sf.rapid_purchase(page, goods_box["goods"])
         stop_hb["v"] = True

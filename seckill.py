@@ -111,25 +111,24 @@ def fmt_price(price):
 
 SECKILL_TIMES = ["10:00", "15:00"]
 
-# 并发请求数
-CONCURRENCY = 10
+# 一轮同时发多少个请求。一次 evaluate 里一起发 N 个 fetch，等全部回来再发下一批，
+# 所以每秒条数 ≈ N ÷ 单条响应耗时。实测未登录时服务端 256ms 就回包，登录态走下单路径明显更慢
+# （按 issue 里的日志反推单轮约 2 秒，那份日志不完整，只当量级参考）。
+# 真相是：限流码回得越慢，一轮越久，能发的条数越少——加并发是唯一能放大的杠杆。
+CONCURRENCY = 30
 
 # 持续发送时间 (秒)
 DURATION_SEC = 10
 
-# 每轮间隔 (毫秒)
-ROUND_INTERVAL_MS = 20
+# 每轮间隔 (毫秒)：一批请求回来后立即发下一批，不再空等
+ROUND_INTERVAL_MS = 0
 
-# 提前多少毫秒开火（负数=提前，相对本机推算出的开抢时刻）
+# 提前多少毫秒开始抢（负数=提前，相对按服务器时间算出的开抢时刻）
 #
-# 恢复成早期版本的 3 秒：对时永远有误差（采样取中位数，实测 ±0.1s，抖动更大），
-# 早发只是换来几条「1101001 秒杀尚未开始」，循环会继续打，不损失任何机会；
-# 而晚发是直接错过窗口，补不回来。所以宁可早，代价只是多几百条废请求。
-#
-# 唯一的副作用是请求量：3 秒 × 500req/s ≈ 1500 条，可能招活动风控
-# （接口里 anti_brush_version=v3）。如果日志开始出现限流类返回码，
-# 把这里调成 -500 即可，别调成 0。
-ADVANCE_MS = -3000
+# 提前量只用来抵消对时和调度抖动。对时改成 get-now 毫秒采样后
+# 实测偏差在 ±20ms，2 秒足够覆盖；再往后提前只是多几条
+# 1101001（秒杀尚未开始），不增加机会。
+ADVANCE_MS = -2000
 
 # ---- do-goods 业务返回码 ----
 CODE_OK = 0
@@ -158,7 +157,11 @@ CODE_DESC = {
 }
 
 # 提前多少秒开始预热连接 (在目标时间前)
-WARMUP_SECONDS = 10
+WARMUP_SECONDS = 20
+
+# 最后多少秒进入纯等待：对时、刷新页面、预热都必须在这之前做完。
+# 这几步都要等网络，压在最后几秒会把提前量直接吃掉。
+QUIET_SECONDS = 15
 
 STATE_PATH = Path(__file__).parent / ".state.json"
 LOG_PATH = Path(__file__).parent / "seckill.log"
@@ -233,7 +236,44 @@ def log(msg):
 
 
 async def sync_time(page):
-    """对时：7次采样 act-api 响应头 Date 取中位数（秒精度噪声±500ms → 收敛到±0.2s），失败回退页面 nowTime"""
+    """对时：调 /dianshi/get-now 取服务器毫秒，按往返时延折半校正。
+
+    取「往返最快的那一次」而不是中位数：网络抖动只会让往返变慢、把偏移算偏，
+    不会让它变快，所以最快的那次最接近真实值。往返相差不大时取这几组的中位数。
+    get-now 直接给毫秒，实测单次往返 130~470ms，校正后偏差在 ±20ms 内。
+    旧实现用响应头 Date 对时，那只有秒精度，实测系统性偏小 0.6~0.7 秒，
+    会让整场抢购整体推迟同样的量。
+    """
+    SAMPLES = 7
+    samples = []          # (rtt, offset)
+    for _ in range(SAMPLES):
+        t0 = time.time() * 1000
+        try:
+            resp = await api_post(page, "/dianshi/get-now", {})
+        except Exception:
+            resp = {}
+        t1 = time.time() * 1000
+        srv = resp.get("data")
+        if resp.get("code") == 0 and isinstance(srv, (int, float)) and srv > 0:
+            samples.append((t1 - t0, srv - (t0 + t1) / 2))
+        await asyncio.sleep(0.05)
+
+    if samples:
+        best_rtt = min(r for r, _ in samples)
+        near = [o for r, o in samples if r <= best_rtt + 20]   # 和最快那次差不多的
+        near.sort()
+        offset = int(near[len(near) // 2])
+        spread = int(max(o for _, o in samples) - min(o for _, o in samples))
+        log(f"服务器时间偏移: {offset:+d}ms "
+            f"(get-now ×{len(samples)}, 最快往返 {best_rtt:.0f}ms, 全部波动 {spread}ms)")
+        return offset
+
+    log("get-now 对时失败，退回 Date 响应头（秒精度，误差可达 1 秒）")
+    return await _sync_time_by_date(page)
+
+
+async def _sync_time_by_date(page):
+    """兜底对时：采样 act-api 响应头 Date 取中位数（只有秒精度）"""
     import email.utils
     SAMPLES = 7
     offsets = []
@@ -741,38 +781,46 @@ async def run(target_time=None, test_mode=False):
         log(f"等待 {wait_sec:.0f}s ({wait_sec/60:.1f}min)")
         log(f"提前量 {abs(ADVANCE_MS)}ms，会在目标时间前 {abs(ADVANCE_MS)/1000:.1f} 秒开始")
 
+        target_ms = target_dt.timestamp() * 1000
+        fire_local_ms = target_ms + ADVANCE_MS - offset_ms   # 开始抢的时刻换算成本机时间
+
         warmed_up = False
         resynced = False
         while True:
-            now_ms = int(time.time() * 1000) + offset_ms
-            remaining = (target_dt.timestamp() * 1000 - now_ms) / 1000
+            remaining = (target_ms - (time.time() * 1000 + offset_ms)) / 1000
 
-            # 剩余 3 分钟时重新对时一次（Date 头实时对时，安全，修正长时间等待的微小漂移）
+            # 最后 QUIET_SECONDS 秒只等待：对时、刷新、预热都要等网络，
+            # 压在最后几秒会把提前量吃掉，所以这段时间一次网络请求都不发。
+            if remaining <= QUIET_SECONDS:
+                log(f"最后 {remaining:.1f}s，只等待不发请求")
+                gap = fire_local_ms - time.time() * 1000
+                if gap > 0:
+                    await asyncio.sleep(gap / 1000)
+                left = target_ms - (time.time() * 1000 + offset_ms)
+                log(f"实际提前 {left:.0f}ms（设定 {abs(ADVANCE_MS)}ms，"
+                    f"偏差 {left - abs(ADVANCE_MS):+.0f}ms）")
+                break
+
+            # 剩余 3 分钟时重新对时一次，修正长时间等待的漂移
             if remaining <= 180 and not resynced:
                 log("剩余3分钟，重新对时...")
                 offset_ms = await sync_time(page)
+                fire_local_ms = target_ms + ADVANCE_MS - offset_ms
                 resynced = True
                 continue  # 用新偏移重算 remaining
 
-            # remaining 是正数表示还没到点，所以是 <= 300ms 时开始（即提前 300ms）
-            if remaining * 1000 <= -ADVANCE_MS:
-                log(f"提前 {abs(ADVANCE_MS)}ms 开火")
-                break
-
-            if remaining <= 10:
-                log(f"{remaining:.1f}s")
-            elif int(remaining) % 60 == 0:
-                log(f"  还剩 {remaining/60:.0f}min")
-
-            # 提前10秒发一个请求，把连接建好；顺便确认资格，没资格就别白等
             if remaining <= WARMUP_SECONDS and not warmed_up:
                 warmed_up = True
                 probe = await warmup(page, goods)
                 if probe.get("code") in NO_RETRY_CODES:
                     log("开抢前已知资格不满足，中止本场")
                     return
+                continue
 
-            await asyncio.sleep(0.05 if remaining <= 5 else 1)
+            if int(remaining) % 60 == 0:
+                log(f"  还剩 {remaining/60:.0f}min")
+
+            await asyncio.sleep(min(1.0, max(0.05, remaining - QUIET_SECONDS)))
 
         # 执行抢购
         success = await rapid_purchase(page, goods)
