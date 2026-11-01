@@ -120,14 +120,26 @@ INFLIGHT = 30
 # 隔多久看一次页面里攒下的返回结果（毫秒）。只影响多快发现成功，不影响发得多快。
 POLL_MS = 40
 
+# 开窗前这段时间只发探针，不铺开（毫秒）。这段时间的请求都是白打的
+# 1101001，还会提前把限流额度用掉。
+#
+# 但最后这一段必须提前铺开：请求从本机到腾讯要时间（往返 70~300ms），
+# 对时本身也有 ±20ms 的误差。要是等估算的开窗时刻才发第一条，
+# 落到服务端时已经晚了 100ms 以上，而名额通常 1 秒内就没了。
+# 所以留 0.6 秒铺开，让第一批请求正好压在开窗那一刻到达。
+PRE_OPEN_FIRE_MS = 600
+
+# 开窗前探针的间隔（毫秒）。探针只是为了保持连接和确认没到点，不用密。
+PROBE_MS = 200
+
 # 持续发送时间 (秒)
 DURATION_SEC = 10
 
 # 提前多少毫秒开始抢（负数=提前，相对按服务器时间算出的开抢时刻）
 #
-# 提前量只用来抵消对时和调度抖动。对时改成 get-now 毫秒采样后
-# 实测偏差在 ±20ms，2 秒足够覆盖；再往后提前只是多几条
-# 1101001（秒杀尚未开始），不增加机会。
+# 这段时间分两段：前段每 200ms 一条探针，最后 0.6 秒（PRE_OPEN_FIRE_MS）全速。
+# 对时改成 get-now 毫秒采样后实测偏差 ±20ms，2 秒足够覆盖
+# 对时误差、调度抖动和网络延迟。
 ADVANCE_MS = -2000
 
 # ---- do-goods 业务返回码 ----
@@ -654,13 +666,16 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
     成功和致命码从页面里攒下的返回结果读。
 
     open_in：距离场次开窗还有多少秒（None=没有窗口概念，直接全速）。
-    提前的那段时间只留一条探针，别把限流额度耗在开窗之前。
+    开窗之前分两段：先每 PROBE_MS 发一条探针，最后 PRE_OPEN_FIRE_MS 全速，
+    这样第一批请求正好压在开窗那一刻到服务端，不早不晚。
     """
     open_at = None if open_in is None else time.monotonic() + open_in
+    ramp_at = None if open_at is None else open_at - PRE_OPEN_FIRE_MS / 1000
     # 已经在窗口里（比如手动抢一场进行中的）就不用探针，直接全速
     ramped = open_at is None or open_in <= 0
     if not ramped:
-        log(f"距开窗 {open_in:.1f}s，先只发一条探针，到点再全速")
+        log(f"距开窗 {open_in:.1f}s，先每 {PROBE_MS}ms 一条探针，"
+            f"最后 {PRE_OPEN_FIRE_MS/1000:g} 秒全速")
     log(f"开始抢购：同时最多 {INFLIGHT} 条，每 {POLL_MS}ms 看一次结果，持续 {duration}s")
 
     params = {
@@ -688,11 +703,16 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
     result = {}
 
     while time.monotonic() - start < duration:
-        if not ramped and time.monotonic() >= open_at:
+        now = time.monotonic()
+        if not ramped and now >= ramp_at:
             ramped = True
             params["cap"] = int(INFLIGHT)
             params["batch"] = int(INFLIGHT)
-            log("  开窗了，全速发")
+            left = open_at - now
+            if left > 0:
+                log(f"  进入最后 {PRE_OPEN_FIRE_MS/1000:g} 秒，全速发（距开窗 {left:.2f}s）")
+            else:
+                log("  开窗了，全速发")
         elif not ramped:
             params["cap"] = 1
             params["batch"] = 1
@@ -754,7 +774,11 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
             log(f"  已发 {fired} 条（{rate:.0f}/秒），"
                 f"还在等 {int(result.get('inflight') or 0)} 条 ({now - start:.1f}s)")
 
-        await asyncio.sleep(POLL_MS / 1000)
+        if ramped:
+            await asyncio.sleep(POLL_MS / 1000)
+        else:
+            # 探针阶段不用密，但别睡过该铺开的时刻
+            await asyncio.sleep(min(PROBE_MS / 1000, max(0.005, ramp_at - time.monotonic())))
 
     # 收尾：先让页面停发，再把还没回来的等一会儿，
     # 免得最后半秒的成功返回被丢掉（数量由服务端按账号限 1，不会因为多发重复下单）
