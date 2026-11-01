@@ -639,7 +639,9 @@ FIRE_JS = """
             body: body,
         }).then(r => r.json()).then(d => {
             st.inflight--; st.done++;
-            const c = d && d.code;
+            // 返回体里没有 code（被限流拦截、走了别的分支）就当没发出去，
+            // 别记成 undefined，否则统计表里看不出真相
+            const c = (d && d.code !== undefined && d.code !== null) ? d.code : -1;
             st.last = c;
             st.codes[c] = (st.codes[c] || 0) + 1;
             if (d && d.msg) st.msgs[c] = String(d.msg).slice(0, 60);
@@ -729,6 +731,7 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
 
         fired = int(result.get("fired") or 0)
         msgs = result.get("msgs") or {}
+        bad_code = None
         for key, cnt in (result.get("codes") or {}).items():
             try:
                 code = int(key)
@@ -740,8 +743,14 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
                 continue
             # 同一种码只报一次，避免刷屏；但一定带上服务器的原话
             seen_codes[code] = cnt
-            log(f"  返回 {code}: {CODE_DESC.get(code, '未知返回码，程序会继续，不影响')}"
-                f" | {msgs.get(key, '')}")
+            if isinstance(code, str) and code not in ("undefined", "null"):
+                # NOT-LOGINED 之类：接口根本没走到抢购逻辑，继续发没意义
+                desc = "不是抢购结果码，登录态可能失效了"
+            else:
+                desc = CODE_DESC.get(code, "未知返回码，程序会继续，不影响")
+            log(f"  返回 {code}: {desc} | {msgs.get(key, '')}")
+            if isinstance(code, str) and code not in ("undefined", "null"):
+                bad_code = code
 
         # 「最后返回码」取最新回来那一条，不是随便挑一个（同时有多条在路上时，回来的顺序是乱的）
         if result.get("last") is not None:
@@ -765,6 +774,11 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
             else:
                 log("  这类错误重试没有意义，本场停止。")
             last_code = fatal
+            break
+
+        if bad_code is not None:
+            log("  本场停止，重新扫码登录再来。")
+            last_code = bad_code
             break
 
         now = time.monotonic()
