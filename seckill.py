@@ -152,10 +152,12 @@ CODE_RATE_LIMIT = 408          # 访问频率过快（开抢瞬间大家都快�
 CODE_BUSY = 1100205            # 系统繁忙（开抢瞬间服务端排队）
 CODE_CONCURRENT = 1100110      # 正在执行其他操作（同账号有单在提交）
 CODE_SOLD_OUT = 1100136        # 当前商品已售罄（本场名额没了）
+CODE_FACE_VERIFY = 1100202     # 账号需要人脸核身校验（账号级拦截，窗口内外都拦）
 
 # 这几个重试没有意义，命中就停，别浪费窗口
 # 售罄也算：订单超过支付时限才回补，跟本场没关系，继续发只是白撞限流
-NO_RETRY_CODES = {CODE_ALREADY_BOUGHT, CODE_NO_QUALIFY, CODE_BAD_PARAM, CODE_SOLD_OUT}
+NO_RETRY_CODES = {CODE_ALREADY_BOUGHT, CODE_NO_QUALIFY, CODE_BAD_PARAM,
+                  CODE_SOLD_OUT, CODE_FACE_VERIFY}
 
 # 开抢瞬间常见的排队信号：并发请求里有的排队、有的成功，继续就行
 QUEUE_CODES = {CODE_NOT_STARTED, CODE_RATE_LIMIT, CODE_BUSY, CODE_CONCURRENT}
@@ -169,6 +171,7 @@ CODE_DESC = {
     CODE_BUSY: "系统繁忙（开抢瞬间排队），继续",
     CODE_CONCURRENT: "同账号有订单正在处理，继续",
     CODE_SOLD_OUT: "商品已售罄（本场名额已经没了）",
+    CODE_FACE_VERIFY: "账号需要人脸核身校验，先去认证才能下单",
     -1: "请求没发出去（网络断了或页面上下文没了）",
 }
 
@@ -178,6 +181,9 @@ WARMUP_SECONDS = 20
 # 最后多少秒进入纯等待：对时、刷新页面、预热都必须在这之前做完。
 # 这几步都要等网络，压在最后几秒会把提前量直接吃掉。
 QUIET_SECONDS = 15
+
+# 人脸核身验证入口。接口的 msg 里本来就带这个链接，这里只当兜底用。
+FACE_VERIFY_URL = "https://cloud.tencent.com/act/pro/face_authentication"
 
 STATE_PATH = Path(__file__).parent / ".state.json"
 LOG_PATH = Path(__file__).parent / "seckill.log"
@@ -769,6 +775,16 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
         if fatal is not None:
             if fatal == CODE_SOLD_OUT:
                 log("  商品已售罄，本场没有名额了，停止。")
+            elif fatal == CODE_FACE_VERIFY:
+                # 账号级拦截：窗口内外都会拦，重试对本场毫无意义，还会加深风控
+                log("  ★ 账号需要人脸核身校验，本场不会再成功了，立即停止。")
+                log(f"  去这里认证（扫码后通常即时通过）：{FACE_VERIFY_URL}")
+                log("  认证完再等下一场；没认证前继续请求只会加重风控标记。")
+                try:
+                    import webbrowser
+                    webbrowser.open(FACE_VERIFY_URL)
+                except Exception:
+                    pass
             elif fatal in (CODE_ALREADY_BOUGHT, CODE_NO_QUALIFY):
                 log(f"  账号这边过不去（{CODE_DESC.get(fatal, '')}），本场停止。")
             else:
@@ -837,6 +853,8 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
             log(f"  最后返回码 {last_code}: {CODE_DESC[last_code]}，只能等下一场")
         elif CODE_DESC.get(last_code):
             log(f"  最后返回码 {last_code}: {CODE_DESC[last_code]}")
+            if last_code == CODE_FACE_VERIFY:
+                log(f"  → 先去做人脸核身：{FACE_VERIFY_URL}，认证完再抢下一场")
         elif last_code == -1:
             log("  最后返回码 -1: 请求本身没发出去（网络/页面上下文问题）")
         elif last_code in QUEUE_CODES:
