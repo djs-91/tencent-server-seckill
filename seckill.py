@@ -113,9 +113,11 @@ SECKILL_TIMES = ["10:00", "15:00"]
 
 # 同时最多发多少个请求。不等这一批全回来，回来一个补一个，
 # 所以每秒能发多少跟单条响应快慢无关（旧做法一批发完等一批，单条 2 秒就只有 5 次/秒）。
-# 数字不敢开大：这个接口对突发很敏感，活动还没开始就能返回 408，
-# 少发一点更稳。每秒条数 ≈ 这个数 ÷ 单条耗时，30 在 2 秒回包时约 15 条/秒。
-INFLIGHT = 30
+# 数字不敢开大：这个接口对突发很敏感。issue 里的实测很说明问题——一次并发 30 条，
+# 网关会把整批当突发直接打回 408×30，而这 30 个位置要 1~2 秒才腾出来，
+# 真正开窗那几秒反而没位置发新请求。12 条能把被整批打回的概率压下去，
+# 位置周转也快；抢到不靠发得多（issue #7 只用 4 条/秒就抢到了）。
+INFLIGHT = 12
 
 # 隔多久看一次页面里攒下的返回结果（毫秒）。只影响多快发现成功，不影响发得多快。
 POLL_MS = 40
@@ -123,11 +125,21 @@ POLL_MS = 40
 # 开窗前这段时间只发探针，不铺开（毫秒）。这段时间的请求都是白打的
 # 1101001，还会提前把限流额度用掉。
 #
-# 但最后这一段必须提前铺开：请求从本机到腾讯要时间（往返 70~300ms），
-# 对时本身也有 ±20ms 的误差。要是等估算的开窗时刻才发第一条，
-# 落到服务端时已经晚了 100ms 以上，而名额通常 1 秒内就没了。
-# 所以留 0.6 秒铺开，让第一批请求正好压在开窗那一刻到达。
-PRE_OPEN_FIRE_MS = 600
+# 但最后这一段必须提前铺开：请求从本机到腾讯要时间（往返 70~300ms）。
+# 关键是——这个提前量不能写死。写死 0.6 秒的话，单程只有 50ms 的人
+# 会在开窗前 0.55 秒就到服务端（白打），单程 400ms 的人又晚了 0.2 秒。
+# 所以改成按实测算：探针阶段顺带量出往返时间，取一半当单程，
+# 开窗前「单程 + 余量」才放开全速，让第一批请求正好在开窗那一刻到服务端。
+PRE_FIRE_MARGIN_MS = 30        # 在单程之外再多留一点，盖住对时误差（实测 ±20ms）
+PRE_FIRE_MIN_MS = 120          # 提前量的下限，别贴太近
+PRE_FIRE_MAX_MS = 450          # 提前量的上限，别太早到（早到就是 1101001）
+ONE_WAY_FALLBACK_MS = 250      # 还没量到往返时的默认单程（README 里模拟用的数）
+
+# 开窗前的探针最多同时在途几条、每次发几条。探针只为焐热连接、量往返、确认没到点。
+PROBE_CAP = 5
+
+# 一轮回来的结果里 408 占多数时，先停多少毫秒再发。
+BACKOFF_MS = 150
 
 # 开窗前探针的间隔（毫秒）。探针只是为了保持连接和确认没到点，不用密。
 PROBE_MS = 200
@@ -137,7 +149,8 @@ DURATION_SEC = 10
 
 # 提前多少毫秒开始抢（负数=提前，相对按服务器时间算出的开抢时刻）
 #
-# 这段时间分两段：前段每 200ms 一条探针，最后 0.6 秒（PRE_OPEN_FIRE_MS）全速。
+# 这段时间分两段：前段每 200ms 一条探针，最后「实测单程 + 30ms」放开全速
+# （提前量按探针量到的往返时间现算，不再写死 0.6 秒）。
 # 对时改成 get-now 毫秒采样后实测偏差 ±20ms，2 秒足够覆盖
 # 对时误差、调度抖动和网络延迟。
 ADVANCE_MS = -2000
@@ -172,6 +185,9 @@ CODE_DESC = {
     CODE_CONCURRENT: "同账号有订单正在处理，继续",
     CODE_SOLD_OUT: "商品已售罄（本场名额已经没了）",
     CODE_FACE_VERIFY: "账号需要人脸核身校验，先去认证才能下单",
+    # 只在 issue 的日志里见过，前端 27 个脚本里查不到（3 位数的码前端一个都没有），
+    # 和 408 一样是接口层给的，就按「慢一点」处理。
+    1101408: "接口层限流（服务端原话见后面的引号，慢一点发）",
     -1: "请求没发出去（网络断了或页面上下文没了）",
 }
 
@@ -618,12 +634,13 @@ FIRE_JS = """
 (params) => {
     const st = window.__sk || (window.__sk = {
         inflight: 0, fired: 0, done: 0, codes: {}, msgs: {},
-        hit: null, fatal: null, stopped: false, last: null,
+        hit: null, fatal: null, stopped: false, last: null, rtt: null,
     });
     if (params.reset) {
         st.inflight = 0; st.fired = 0; st.done = 0;
         st.codes = {}; st.msgs = {};
         st.hit = null; st.fatal = null; st.stopped = false; st.last = null;
+        st.rtt = null;
     }
     if (params.stop) st.stopped = true;
 
@@ -637,6 +654,7 @@ FIRE_JS = """
     let n = 0;
     while (n < params.batch && st.inflight < params.cap && !st.stopped && !st.hit && !st.fatal) {
         st.inflight++; st.fired++; n++;
+        const t0 = Date.now();       // 用来量往返：开窗前的提前量按这个现算
         fetch(params.url, {
             method: 'POST',
             headers: {'Content-Type': 'application/json',
@@ -645,6 +663,8 @@ FIRE_JS = """
             body: body,
         }).then(r => r.json()).then(d => {
             st.inflight--; st.done++;
+            const dt = Date.now() - t0;
+            if (st.rtt === null || dt < st.rtt) st.rtt = dt;
             // 返回体里没有 code（被限流拦截、走了别的分支）就当没发出去，
             // 别记成 undefined，否则统计表里看不出真相
             const c = (d && d.code !== undefined && d.code !== null) ? d.code : -1;
@@ -662,7 +682,7 @@ FIRE_JS = """
     }
     return {fired: st.fired, inflight: st.inflight, done: st.done,
             codes: st.codes, msgs: st.msgs, hit: st.hit, fatal: st.fatal,
-            last: st.last};
+            last: st.last, rtt: st.rtt};
 }
 """
 
@@ -674,16 +694,19 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
     成功和致命码从页面里攒下的返回结果读。
 
     open_in：距离场次开窗还有多少秒（None=没有窗口概念，直接全速）。
-    开窗之前分两段：先每 PROBE_MS 发一条探针，最后 PRE_OPEN_FIRE_MS 全速，
-    这样第一批请求正好压在开窗那一刻到服务端，不早不晚。
+    开窗之前分两段：先每 PROBE_MS 发一条探针（顺带量出往返时间），
+    等算出单程、定好提前量以后才放开全速——提前量 = 实测单程 + 余量，
+    让第一批请求正好在开窗那一刻到服务端：太早到是白打的 1101001，
+    太晚到名额可能已经没了。
     """
     open_at = None if open_in is None else time.monotonic() + open_in
-    ramp_at = None if open_at is None else open_at - PRE_OPEN_FIRE_MS / 1000
     # 已经在窗口里（比如手动抢一场进行中的）就不用探针，直接全速
     ramped = open_at is None or open_in <= 0
+    pre_fire = float(PRE_FIRE_MAX_MS)     # 还没量到往返，先按最保守的值占位
+    ramp_at = None if open_at is None else open_at - pre_fire / 1000
     if not ramped:
-        log(f"距开窗 {open_in:.1f}s，先每 {PROBE_MS}ms 一条探针，"
-            f"最后 {PRE_OPEN_FIRE_MS/1000:g} 秒全速")
+        log(f"距开窗 {open_in:.1f}s，先每 {PROBE_MS}ms 一条探针量往返，"
+            f"开窗前按实测单程提前铺开")
     log(f"开始抢购：同时最多 {INFLIGHT} 条，每 {POLL_MS}ms 看一次结果，持续 {duration}s")
 
     params = {
@@ -693,8 +716,8 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
         "type": goods["type"],
         "goods_param": goods.get("goods_param", {}),
         "preview": 0,          # 真抢：会真的下单
-        "cap": int(INFLIGHT),
-        "batch": int(INFLIGHT),
+        "cap": int(INFLIGHT) if ramped else min(PROBE_CAP, int(INFLIGHT)),
+        "batch": int(INFLIGHT) if ramped else 1,
         "ok": CODE_OK,
         "norety": sorted(NO_RETRY_CODES),
         "reset": True,
@@ -709,21 +732,34 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
     err_count = 0
     next_progress = start + 2
     result = {}
+    done_prev = 0            # 上一轮回来多少条、其中 408 多少条：用来看这一轮是不是整批被打回
+    rl_prev = 0
+    backoff_ms = 0
 
     while time.monotonic() - start < duration:
         now = time.monotonic()
-        if not ramped and now >= ramp_at:
-            ramped = True
-            params["cap"] = int(INFLIGHT)
-            params["batch"] = int(INFLIGHT)
-            left = open_at - now
-            if left > 0:
-                log(f"  进入最后 {PRE_OPEN_FIRE_MS/1000:g} 秒，全速发（距开窗 {left:.2f}s）")
+        if not ramped:
+            # 每轮都按最新量到的往返重算「什么时候铺开」：单程 = 往返 ÷ 2。
+            # 不写死提前量，是为了让单程 50ms 和 400ms 的人都在开窗那一刻到。
+            rtt = result.get("rtt")
+            one_way = ONE_WAY_FALLBACK_MS if not rtt else float(rtt) / 2
+            pre_fire = min(float(PRE_FIRE_MAX_MS),
+                           max(float(PRE_FIRE_MIN_MS), one_way + PRE_FIRE_MARGIN_MS))
+            ramp_at = open_at - pre_fire / 1000
+            if now >= ramp_at:
+                ramped = True
+                params["cap"] = int(INFLIGHT)
+                params["batch"] = int(INFLIGHT)
+                left = open_at - now
+                rtt_txt = f"{rtt}ms" if rtt else "还没量到"
+                if left > 0:
+                    log(f"  开窗前 {pre_fire:.0f}ms 放开全速"
+                        f"（实测往返 {rtt_txt}，距开窗 {left:.2f}s）")
+                else:
+                    log(f"  开窗了，全速发（实测往返 {rtt_txt}）")
             else:
-                log("  开窗了，全速发")
-        elif not ramped:
-            params["cap"] = 1
-            params["batch"] = 1
+                params["cap"] = min(PROBE_CAP, int(INFLIGHT))
+                params["batch"] = 1
         params["reset"] = False
         try:
             result = await page.evaluate(FIRE_JS, params) or {}
@@ -774,7 +810,13 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
         fatal = result.get("fatal")
         if fatal is not None:
             if fatal == CODE_SOLD_OUT:
-                log("  商品已售罄，本场没有名额了，停止。")
+                # 带上距开窗多少毫秒：以后看日志就知道这场名额死得有多快
+                if open_at is None:
+                    log("  商品已售罄，本场没有名额了，停止。")
+                else:
+                    ms_from_open = (time.monotonic() - open_at) * 1000
+                    log(f"  商品已售罄，本场没有名额了，停止。"
+                        f"（距开窗 {ms_from_open:+.0f} 毫秒）")
             elif fatal == CODE_FACE_VERIFY:
                 # 账号级拦截：窗口内外都会拦，重试对本场毫无意义，还会加深风控
                 log("  ★ 账号需要人脸核身校验，本场不会再成功了，立即停止。")
@@ -804,8 +846,19 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
             log(f"  已发 {fired} 条（{rate:.0f}/秒），"
                 f"还在等 {int(result.get('inflight') or 0)} 条 ({now - start:.1f}s)")
 
+        # 这一轮回来的里面 408 占多数，说明整批又被当成突发打回了：
+        # 停一下再发，别把限流越撞越死（越撞越死会让位置一直腾不出来）
+        codes_now = result.get("codes") or {}
+        rl_now = int(codes_now.get(str(CODE_RATE_LIMIT))
+                     or codes_now.get(CODE_RATE_LIMIT) or 0)
+        done_now = int(result.get("done") or 0)
+        round_done = done_now - done_prev
+        round_rl = rl_now - rl_prev
+        done_prev, rl_prev = done_now, rl_now
+        backoff_ms = BACKOFF_MS if (round_done >= 8 and round_rl * 3 >= round_done * 2) else 0
+
         if ramped:
-            await asyncio.sleep(POLL_MS / 1000)
+            await asyncio.sleep((backoff_ms or POLL_MS) / 1000)
         else:
             # 探针阶段不用密，但别睡过该铺开的时刻
             await asyncio.sleep(min(PROBE_MS / 1000, max(0.005, ramp_at - time.monotonic())))
@@ -833,6 +886,7 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
     elapsed = time.monotonic() - start
     log(f"抢购结束: {fired} 次请求, {elapsed:.1f}s, {'成功' if success else '未抢到'}")
     tally = result.get("codes") or {}
+    msgs = result.get("msgs") or {}
     if tally:
         def _label(k):
             try:
@@ -845,7 +899,12 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
                 return "没发出去"
             return str(k)
         parts = sorted(tally.items(), key=lambda kv: -kv[1])
-        log("  各码次数: " + ", ".join(f"{_label(k)}×{v}" for k, v in parts))
+        pieces = []
+        for k, v in parts:
+            # 每个码都带上服务器原话：认不出的码（比如 1101408）靠这句话才能定性
+            msg = str(msgs.get(k) or msgs.get(str(k)) or "").strip()
+            pieces.append(f"{_label(k)}×{v}" + (f"（{msg}）" if msg else ""))
+        log("  各码次数: " + ", ".join(pieces))
     if not success and last_code is not None:
         if isinstance(last_code, str):
             log(f"  最后返回码 {last_code}: 登录态校验没过，重新扫码登录再试")
