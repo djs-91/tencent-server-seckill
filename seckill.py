@@ -626,7 +626,8 @@ async def warmup(page, goods):
     elif code == CODE_NOT_STARTED:
         log("  预热完成（还没到场次时间，正常）")
     else:
-        log(f"  预热完成（code={code}，{CODE_DESC.get(code, '排队信号，不影响')}）")
+        log(f"  预热完成（code={code}，{CODE_DESC.get(code, '未识别的返回码，请附服务器原话发 issue')}）")
+        log(f"  服务器原话: {str(result.get('msg') or '')[:70]}")
     return result
 
 
@@ -789,7 +790,7 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
                 # NOT-LOGINED 之类：接口根本没走到抢购逻辑，继续发没意义
                 desc = "不是抢购结果码，登录态可能失效了"
             else:
-                desc = CODE_DESC.get(code, "未知返回码，程序会继续，不影响")
+                desc = CODE_DESC.get(code, "未识别的返回码，程序会继续；请附服务器原话发 issue")
             log(f"  返回 {code}: {desc} | {msgs.get(key, '')}")
             if isinstance(code, str) and code not in ("undefined", "null"):
                 bad_code = code
@@ -920,7 +921,7 @@ async def rapid_purchase(page, goods, duration=DURATION_SEC, open_in=None):
             log(f"  最后返回码 {last_code}: {CODE_DESC.get(last_code, '排队信号')}"
                 f"。这类码刷屏不影响抢购，没抢到就是名额没了或时间窗不对")
         else:
-            log(f"  最后返回码 {last_code}: 未知返回码，把这段日志发个 issue 就行")
+            log(f"  最后返回码 {last_code}: 未识别的返回码，请附服务器原话发 issue")
     return success
 
 
