@@ -818,7 +818,8 @@ async def test_once(region_id):
     c("  别反复测：短时间多次建单会触发风控，有人被限制到第二天。", Fore.RED)
     c("!" * 58, Fore.YELLOW)
     try:
-        y = input("  确认真下单？输入 YES 继续: ").strip()
+        # 大小写都认：曾有人输 yes 被当成取消，以为程序坏了（issue #14）
+        y = input("  确认真下单？输入 YES 继续: ").strip().upper()
     except (EOFError, KeyboardInterrupt):
         return
     if y != "YES":
