@@ -3,3 +3,6 @@ venv/
 .state.json
 config.json
 *.log
+*.bak
+*.bak-*
+_verify/
