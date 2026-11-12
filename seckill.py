@@ -15,6 +15,7 @@
 """
 
 import asyncio
+import json
 import argparse
 import sys
 import time
@@ -632,7 +633,7 @@ def attach_csrf_sniffer(page):
 async def ensure_csrf(page, force=False):
     """保证 window.__latestCsrf 有值。
 
-    顺序：页面自己的 -> 协议层嗅探到的 -> 从 cookie 现算 g_tk。
+    顺序：从 context cookie 现算 g_tk -> 页面自己的 -> 协议层嗅探到的 -> 页面里现算。
     拿不到就返回 None，调用方不要拿空 token 硬发请求（空 token 会换来
     400 CSRF-ERROR，再被误判成登录失效，这才是"反复要求扫码"的根源）。
 
@@ -653,6 +654,20 @@ async def ensure_csrf(page, force=False):
         # 重算不出来（页面里没 skey）就用嗅探到的，仍是拿不到才返回 None
         return getattr(page, "_csrf_sniff", None)
 
+    # 首选：直接从 cookie 现算 g_tk。实测服务端认这个（2026-11-12：
+    # g_tk(skey) 能过 CSRF 校验，qcmainCSRFToken 过不了），而且不依赖
+    # 页面有没有跑过我们的 hook。FIRE_JS 读的是 window.__latestCsrf，
+    # 所以算出来后顺手写回页面。
+    try:
+        tok = await csrf_from_context(page.context)
+        if tok:
+            try:
+                await page.evaluate("(v) => { window.__latestCsrf = v; }", tok)
+            except Exception:
+                pass
+            return tok
+    except Exception:
+        pass
     try:
         cur = await page.evaluate("() => window.__latestCsrf || null")
         if cur:
@@ -723,6 +738,181 @@ async def _report_state_cookies(ctx):
         return f"{len(cookies)} 条，含 {'/'.join(keys)}"
     return f"{len(cookies)} 条，缺 skey/uin（登录态不完整）"
 
+# ---------- 登录态：保存 / 校验 ----------
+#
+# 2026-11-12 实测（用一份已经失效的 .state.json 直接打接口）：
+#   POST /user/get-vip-info
+#     x-csrf-token = qcmainCSRFToken   -> 400 {"code":"CSRF-ERROR"}
+#     x-csrf-token = g_tk(skey)        -> 200 {"code":"NOT-LOGINED"}
+# 说明 act-api 认的 csrf 就是 g_tk(skey)，跟页面 hook 到的那个值同源。
+# 所以 csrf 不该依赖"页面有没有发过请求"，直接从 cookie 现算。
+VIP_INFO_URL = API_BASE + "/user/get-vip-info"
+
+# 同一份 state 的另一个实测：拿失效的 skey 打开 cloud.tencent.com，
+# 页面自己的 /services/ajax/get_user_info?mc_gtk=<正确值> 会收到
+#   Set-Cookie: uin=; Expires=1970 ... / Set-Cookie: skey=;
+# 也就是**打开页面这个动作本身**会把登录 cookie 清掉。于是"校验登录态"
+# 反而毁了登录态，用户看到的就是"登录状态无法保存、每次都要重扫码"。
+# 结论：校验只许打 act-api 的查询接口，不许加载活动页。
+LOGIN_COOKIE_NAMES = ("skey", "p_skey", "uin", "tinyid")
+STATE_KEEP_DAYS = 30
+
+
+def gtk_of(skey):
+    """按前端 g_tk 算法从 skey 算 csrf token。skey 为空返回 None。"""
+    if not skey:
+        return None
+    e = 5381
+    for ch in skey:
+        e += (e << 5) + ord(ch)
+    return str(2147483647 & e)
+
+
+def _cookies_of_state(path=STATE_PATH):
+    """读 state 文件里的 cookie，返回 {name: value}。读不出来返回空 dict。"""
+    try:
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    cs = d.get("cookies") or []
+    out = {}
+    for c in cs:
+        if isinstance(c, dict) and c.get("name"):
+            out[c["name"]] = c.get("value")
+    return out
+
+
+def state_gtk(path=STATE_PATH):
+    ck = _cookies_of_state(path)
+    return gtk_of(ck.get("skey") or ck.get("p_skey"))
+
+
+async def csrf_from_context(ctx):
+    """从 context 的 cookie 现算 csrf token。
+
+    比页面上 hook 到的值稳：不依赖页面是否已经发过带 token 的请求，
+    也不依赖 hook 有没有被 service worker / iframe 绕过。
+    """
+    try:
+        cookies = await ctx.cookies()
+    except Exception:
+        return None
+    for name in ("skey", "p_skey"):
+        for c in cookies:
+            if c.get("name") == name:
+                tok = gtk_of(c.get("value"))
+                if tok:
+                    return tok
+    return None
+
+
+async def save_state_safe(ctx, path=STATE_PATH):
+    """存登录态并读回校验，新快照缺 skey/uin 时保留旧文件。返回 (ok, desc)。
+
+    先写临时文件、校验通过再替换，避免写一半把原文件搞坏。
+
+    落盘时把 skey/uin/tinyid 这几个会话 cookie（expires=-1）的有效期抻到 30 天：
+    只改本地文件里的 expires，不改服务端语义（失效的 skey 照样会被服务端拒），
+    但能避免"浏览器一关，会话 cookie 在别处就被当过期"这类凭空丢失。
+    """
+    tmp = Path(path).with_name(Path(path).name + ".tmp")
+    try:
+        await ctx.storage_state(path=str(tmp))
+    except Exception as e:
+        return False, f"写入失败: {str(e)[:40]}"
+
+    def _keys_of(p):
+        try:
+            d = json.loads(Path(p).read_text(encoding="utf-8"))
+        except Exception:
+            return None, 0
+        cs = [c for c in (d.get("cookies") or []) if isinstance(c, dict)]
+        names = {c.get("name") for c in cs}
+        return [k for k in ("skey", "p_skey", "uin") if k in names], len(cs)
+
+    new_keys, n = _keys_of(tmp)
+    if new_keys is None:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+        return False, "读回失败（临时文件不可解析）"
+
+    if not new_keys and Path(path).exists():
+        old_keys, old_n = _keys_of(path)
+        if old_keys:
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+            log(f"本次快照缺 skey/uin（{n} 条），保留原登录态（{old_n} 条，含 {'/'.join(old_keys)}）")
+            return True, f"保留原登录态（{old_n} 条，含 {'/'.join(old_keys)}）"
+
+    if new_keys:
+        try:
+            d = json.loads(tmp.read_text(encoding="utf-8"))
+            until = time.time() + STATE_KEEP_DAYS * 86400
+            for c in d.get("cookies") or []:
+                if isinstance(c, dict) and c.get("name") in LOGIN_COOKIE_NAMES:
+                    if not c.get("expires") or float(c.get("expires") or -1) <= 0:
+                        c["expires"] = until
+            tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass  # 改有效期只是加固，失败不影响主流程
+
+    try:
+        import os as _os
+        _os.replace(str(tmp), str(path))
+    except Exception as e:
+        return False, f"替换失败: {str(e)[:40]}"
+
+    if new_keys:
+        return True, f"{n} 条，含 {'/'.join(new_keys)}"
+    return False, f"{n} 条，缺 skey/uin"
+
+
+async def verify_state(ctx):
+    """只打接口、不加载页面地校验登录态。返回 (state, detail)。
+
+    state: 'ok' / 'not-logged' / 'csrf' / 'unknown'
+    detail: 服务端原话，便于日志定位。
+
+    'csrf' 说明 cookie 在、只是 token 没对上（重新算即可），**不能当作已登录**，
+    更不能当作未登录 —— 但不能像以前那样当成"登录成功"就存盘，那正是
+    "存了一份假登录态、下次复验必失败"的来源。
+    """
+    tok = await csrf_from_context(ctx)
+    if not tok:
+        return "not-logged", "cookie 里没有 skey（未登录）"
+    try:
+        r = await ctx.request.post(
+            VIP_INFO_URL, data="{}",
+            headers={
+                "Content-Type": "application/json",
+                "x-csrf-token": tok,
+                "Origin": "https://cloud.tencent.com",
+                "Referer": ACTIVITY_URL,
+            },
+        )
+        body = (await r.text()) or ""
+    except Exception as e:
+        return "unknown", str(e)[:60]
+
+    try:
+        j = json.loads(body)
+    except Exception:
+        return "unknown", body[:60]
+
+    code = j.get("code")
+    text = str(code if code is not None else "").strip().upper()
+    msg = str(j.get("msg") or "")[:60]
+    if "CSRF" in text:
+        return "csrf", msg
+    if code in (0, "0") or text in ("OK", "SUCCESS", "SUCC"):
+        return "ok", msg
+    if "NOT" in text and "LOGIN" in text:
+        return "not-logged", msg or text
+    return "unknown", msg or text
 
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -1099,6 +1289,18 @@ async def probe_goods(page, goods):
     return results[0] if results else {"code": -1, "msg": "无返回"}
 
 
+async def place_single_order(page, goods):
+    """测试下单：只发**一条** preview=0 请求，返回服务端返回体。
+
+    以前的测试下单直接复用整台抢购机器（在途 30→64、3 秒 177 条），
+    可在非窗口时段这么打必然被网关按频率打回：实测 2026-11-12 13:21
+    的 177 条里 152 条 408、25 条 1100205，一条有效信息都没拿到，
+    还白白加深风控。测试只需要一条请求 + 服务端原话。
+    """
+    results = await do_goods_raw(page, goods, preview=0, concurrency=1)
+    return results[0] if results else {"code": -1, "msg": "无返回"}
+
+
 async def check_qualify(page, goods, regions=None):
     """调 check-available 查「我有没有资格买」和「各地域还剩多少」。
 
@@ -1182,6 +1384,10 @@ async def warmup(page, goods):
     else:
         log(f"  预热完成（code={code}，{CODE_DESC.get(code, '未识别的返回码，请附服务器原话发 issue')}）")
         log(f"  服务器原话: {str(result.get('msg') or '')[:70]}")
+        if code in (CODE_RATE_LIMIT, CODE_RATE_LIMIT_API, CODE_BUSY):
+            # 预热是**单发一条**。单发都被打回，说明限的是账号/IP，不是我们的并发。
+            log("  ⚠ 单发一条就限流：这是账号/IP 级，不是并发太高，减在途、改参数都没用")
+            log("     刚做过测试下单 / 反复登录 / 高频刷新的话，等 5~10 分钟再来")
     return result
 
 
@@ -1881,10 +2087,23 @@ async def run(target_time=None, test_mode=False):
             except PwTimeout:
                 pass
 
-        # 保存登录状态（顺手报一下 skey/uin 在不在，不再无条件说"已保存"）
-        await ctx.storage_state(path=str(STATE_PATH))
-        _names = await _report_state_cookies(ctx)
-        log(f"登录状态已保存（cookie {_names}）")
+        # 保存登录状态（写临时文件 → 读回校验 → 替换；缺 skey/uin 不覆盖旧文件）
+        _saved, _desc = await save_state_safe(ctx)
+        if _saved:
+            log(f"登录状态已保存（{_desc}）")
+        else:
+            log(f"登录状态没能保存（{_desc}）")
+        # 用接口验一次真假：不加载页面，避免"校验把 cookie 校验没了"
+        _st, _msg = await verify_state(ctx)
+        if _st == "ok":
+            log("登录态服务端校验通过")
+        elif _st == "not-logged":
+            log(f"服务端说没登录（{_msg}）：扫码后要在手机上点【确认登录】，"
+                f"确认完等 3~5 秒再继续")
+        elif _st == "csrf":
+            log(f"csrf 没对齐（{_msg}），cookie 在、登录态可能有效，继续")
+        else:
+            log(f"登录态没能确认（{_st} {_msg}），按有效继续")
 
         # 同步时间
         offset_ms = await sync_time(page)
@@ -1933,11 +2152,16 @@ async def run(target_time=None, test_mode=False):
             if price and price.get("real_cost") != TEST_REAL_COST:
                 log(f"  注意：这个不是 109 元的测试商品（实际 {fmt_price(price)}），"
                     f"act_id 可能已经变了")
-            ok = await rapid_purchase(page, goods, duration=5)
-            if ok:
+            # 只发一条：测试时段高频打接口只会换来一地 408，测不出任何东西
+            res = await place_single_order(page, goods)
+            code = res.get("code")
+            if code == CODE_OK:
                 log("已建单 —— 请去控制台取消订单，不要付款。")
             else:
-                log("未成交，看上面的返回码说明。")
+                log(f"返回 {code}: {CODE_DESC.get(code, '未识别的返回码，请附服务器原话发 issue')}")
+                log(f"  服务器原话: {str(res.get('msg') or '')[:80]}")
+                if code in QUEUE_CODES:
+                    log("  这类码是网关限流/排队，不是下单逻辑问题：等 5~10 分钟再测")
             return
 
         # 等待抢购时间
@@ -2036,7 +2260,8 @@ async def run(target_time=None, test_mode=False):
         traceback.print_exc()
     finally:
         try:
-            await ctx.storage_state(path=str(STATE_PATH))
+            # 退出前也走同一套保护：缺 skey/uin 不覆盖已存好的登录态
+            await save_state_safe(ctx)
         except:
             pass
         await browser.close()

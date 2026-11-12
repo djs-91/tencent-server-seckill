@@ -174,57 +174,13 @@ async def _wait_csrf(page, tries=50):
 
 
 async def _save_state(ctx):
-    """存登录态，并读回校验关键 cookie 是否真的落盘。
+    """存登录态。
 
-    返回 (ok, desc)。desc 给人看，形如 "21 条，含 skey/uin"。
-
-    两条保护：
-    1. 先写临时文件、校验通过才替换，避免写一半把原文件搞坏。
-    2. 新快照缺 skey/uin 而原文件有，就保留原文件 —— 否则一次网络抖动
-       就能把用户刚扫好的登录态覆盖成空壳，下次又得重扫。
+    实现搬到 seckill.save_state_safe：临时文件写入 → 读回校验 → 替换，
+    新快照缺 skey/uin 时保留旧文件，落盘时把会话 cookie 的有效期抻长。
+    两个入口共用同一套保护，别各写一份。
     """
-    tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
-    try:
-        await ctx.storage_state(path=str(tmp))
-    except Exception as e:
-        log(f"保存登录态失败: {e}")
-        return False, f"写入失败: {str(e)[:40]}"
-
-    def _keys_of(path):
-        try:
-            d = json.loads(Path(path).read_text(encoding="utf-8"))
-        except Exception:
-            return None, 0
-        cs = [c for c in (d.get("cookies") or []) if isinstance(c, dict)]
-        names = {c.get("name") for c in cs}
-        return [k for k in ("skey", "p_skey", "uin") if k in names], len(cs)
-
-    new_keys, n = _keys_of(tmp)
-    if new_keys is None:
-        try:
-            tmp.unlink()
-        except Exception:
-            pass
-        return False, "读回失败（临时文件不可解析）"
-
-    if not new_keys and STATE_PATH.exists():
-        old_keys, old_n = _keys_of(STATE_PATH)
-        if old_keys:
-            try:
-                tmp.unlink()
-            except Exception:
-                pass
-            log(f"本次快照缺 skey/uin（{n} 条），保留原登录态（{old_n} 条，含 {'/'.join(old_keys)}）")
-            return True, f"保留原登录态（{old_n} 条，含 {'/'.join(old_keys)}）"
-
-    try:
-        os.replace(str(tmp), str(STATE_PATH))
-    except Exception as e:
-        return False, f"替换失败: {str(e)[:40]}"
-
-    if new_keys:
-        return True, f"{n} 条，含 {'/'.join(new_keys)}"
-    return False, f"{n} 条，缺 skey/uin"
+    return await sf.save_state_safe(ctx, STATE_PATH)
 
 
 async def _has_login_cookie(ctx):
@@ -357,14 +313,10 @@ async def do_login():
                 try:
                     vheadless = await sf.launch_browser(pw, headless=True)
                     vctx = await vheadless.new_context(storage_state=str(STATE_PATH), user_agent=UA)
-                    await vctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
-                    await vctx.add_init_script(sf.CSRF_HOOK_JS)
-                    vpage = await vctx.new_page()
-                    sf.attach_csrf_sniffer(vpage)
-                    await vpage.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
-                    await asyncio.sleep(2)
-                    await _wait_csrf(vpage, tries=25)
-                    re_state, _ = await _check_login(vpage)
+                    # 只打接口，**不加载页面**：实测用失效的 skey 打开 cloud.tencent.com，
+                    # 服务端会回 Set-Cookie: skey=; uin=; 把刚存好的登录态当场清掉，
+                    # 于是"校验"反而毁了登录态，表现就是"登录状态无法保存"。
+                    re_state, re_msg = await sf.verify_state(vctx)
                     await vctx.close()
                 except Exception as e:
                     c(f"复验出错: {e}", Fore.YELLOW)
@@ -471,17 +423,16 @@ async def ensure_login():
         await ctx.add_init_script(sf.CSRF_HOOK_JS)
         page = await ctx.new_page()
         sf.attach_csrf_sniffer(page)
-        await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(2)
-        await _wait_csrf(page, tries=25)
-        state, r = await _check_login(page)
+        # 只打接口验，**不加载活动页**。
+        # 实测（2026-11-12）：用已失效的 skey 打开 cloud.tencent.com，服务端
+        # 会回 Set-Cookie: uin=; skey=; 把 cookie 清掉 —— 也就是"校验登录态"
+        # 这个动作本身把登录态毁了，用户就永远在校验失败、重扫码之间打转。
+        state, detail = await sf.verify_state(ctx)
         if state in ("csrf", "unknown"):
-            # 首屏没就绪或被 EdgeOne 挑战页拦一下时会瞬时失败，再等一轮重试，
-            # 否则会误判登录态失效、让人白扫一次码
-            await asyncio.sleep(3)
-            await _wait_csrf(page, tries=25)
-            state, r = await _check_login(page)
-        detail = str(r.get("code") or r.get("__err") or "")[:40]
+            # 首屏/网关抖动时会瞬时失败，再验一轮；csrf 会用 cookie 重算 token
+            await asyncio.sleep(2)
+            state, detail = await sf.verify_state(ctx)
+        detail = str(detail or "")[:40]
     except Exception as e:
         log(f"登录态校验异常，按有效处理: {e}")
         return True
@@ -571,9 +522,9 @@ async def run_grab(region_id, target_time=None, rotate=True):
         await asyncio.sleep(3)
 
         try:
-            state, r = await _check_login(page)
+            state, detail = await sf.verify_state(ctx)
             if state == "not-logged":
-                c(f"登录态无效（{r.get('code') or r.get('__err')}）", Fore.RED)
+                c(f"登录态无效（{detail or '服务端说没登录'}）", Fore.RED)
                 y = input("  是否现在重新扫码登录？(y/n): ").strip().lower()
                 if y == "y":
                     if await do_login():
@@ -675,11 +626,11 @@ async def run_grab(region_id, target_time=None, rotate=True):
                             log(f"  第{attempt}次刷新失败: {str(e)[:80]}")
                     if csrf_ok:
                         try:
-                            state, r = await _check_login(page)
+                            state, detail = await sf.verify_state(ctx)
                             if state == "ok":
                                 log("登录态复验通过")
                             elif state == "not-logged":
-                                c(f"!! 登录态已失效（{r.get('code') or r.get('__err')}），请中断后重新扫码", Fore.RED)
+                                c(f"!! 登录态已失效（{detail or '服务端说没登录'}），请中断后重新扫码", Fore.RED)
                             else:
                                 log(f"登录复验未能确认（{state}），继续（csrf 问题不代表登录失效）")
                         except Exception as e:
@@ -815,6 +766,7 @@ def show_menu():
     c("  [3] 开始抢购（自动找最近场次 10:00/15:00）", Fore.WHITE)
     c("  [4] 选择场次抢购（10:00 / 15:00）", Fore.WHITE)
     c("  [5] 测试下单流程（不付款；测完取消订单，不要反复测）", Fore.WHITE)
+    c("  [6] 检查登录态（只打接口，不加载页面、不动 cookie）", Fore.WHITE)
     c("  [0] 退出", Fore.WHITE)
     c("-" * 56, Fore.WHITE)
     c("提示: 扫码后紧接着开抢，中间不要关闭弹出的浏览器窗口。", Fore.CYAN)
@@ -895,9 +847,9 @@ async def test_once(region_id):
         await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(3)
         await _wait_csrf(page)
-        state, r = await _check_login(page)
+        state, detail = await sf.verify_state(ctx)
         if state == "not-logged":
-            c(f"  登录态无效（{r.get('code') or r.get('__err')}），先扫码登录再试。", Fore.RED)
+            c(f"  登录态无效（{detail or '服务端说没登录'}），先扫码登录再试。", Fore.RED)
             return
         if state != "ok":
             c(f"  登录态未能确认（{state}），继续尝试。", Fore.YELLOW)
@@ -908,15 +860,82 @@ async def test_once(region_id):
         if price and price.get("real_cost") != sf.TEST_REAL_COST:
             c(f"  注意：不是 109 元那款（实际 {sf.fmt_price(price)}），act_id 可能已变", Fore.RED)
         c(f"  地域: {REGIONS.get(region_id, region_id)}", Fore.CYAN)
-        c("  开始测试下单（持续 3 秒）...", Fore.CYAN)
-        ok = await sf.rapid_purchase(page, goods, duration=3)
-        if ok:
-            c("  已建单 —— 请去控制台把这个订单取消掉，不要付款。", Fore.GREEN)
+        # 下单接口常被单独限流，先跑只读的 check-available：
+        # 它能证明登录态、活动 id、商品参数都通了，不需要真建单。
+        q = await sf.check_qualify(page, goods, [region_id])
+        if q.get("ok"):
+            c(f"  只读预检: user_available={q.get('user_available')} "
+              f"idcard_available={q.get('idcard_available')} 库存={q.get('quota')}", Fore.CYAN)
+            log(f"  check-available 通过: user={q.get('user_available')} "
+                f"idcard={q.get('idcard_available')} quota={q.get('quota')}")
         else:
-            c("  未成交，看上面日志里的返回码说明。", Fore.YELLOW)
+            c(f"  只读预检没过（{q.get('error')}），先看这个再谈下单", Fore.YELLOW)
+            log(f"  check-available 失败: {q.get('error')}")
+        c("  开始测试下单（只发 1 条请求，避免被网关按频率打回）...", Fore.CYAN)
+        r = await sf.place_single_order(page, goods)
+        code = r.get("code")
+        msg = str(r.get("msg") or "")[:120]
+        if code == sf.CODE_OK:
+            deal = r.get("data") or {}
+            c("  已建单 —— 请去控制台把这个订单取消掉，不要付款。", Fore.GREEN)
+            log(f"  订单号: {(deal.get('deal_names') or ['?'])[0]}"
+                f" / 大单号: {deal.get('big_deal_no') or '?'}")
+        else:
+            if isinstance(code, str):
+                desc = "不是下单结果码（登录态或参数问题）"
+            else:
+                desc = sf.CODE_DESC.get(
+                    code, "未识别的返回码，请附服务器原话发 issue")
+            c(f"  返回 {code}: {desc}", Fore.YELLOW)
+            if msg:
+                c(f"  服务器原话: {msg}", Fore.WHITE)
+            log(f"  测试下单返回 {code}: {desc} | {msg}")
+            if code in sf.QUEUE_CODES:
+                c("  这类码是网关限流/排队，不是下单逻辑的问题：等 5~10 分钟再测，"
+                  "或者直接等场次（测试时段本来就不该高频打接口）。", Fore.YELLOW)
     except Exception as e:
         log(f"真下单异常: {str(e)[:120]}")
         return
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+
+
+async def check_login_only():
+    """只打接口验登录态：不加载活动页（加载会触发服务端清 cookie），不改任何文件。"""
+    if not STATE_PATH.exists():
+        c("  没有登录态文件，先走 [2] 扫码登录。", Fore.RED)
+        return False
+    pw = None
+    browser = None
+    try:
+        from playwright.async_api import async_playwright
+        pw = await async_playwright().start()
+        browser = await sf.launch_browser(pw, headless=True)
+        ctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
+        state, detail = await sf.verify_state(ctx)
+        if state == "ok":
+            c(f"  登录态有效（服务端返回 {detail or 'OK'}）", Fore.GREEN)
+        elif state == "csrf":
+            c(f"  cookie 在，但 csrf 没对齐（{detail}）；开抢时会自动用 cookie 重算，通常不影响", Fore.YELLOW)
+        elif state == "not-logged":
+            c(f"  登录态已失效（{detail or '服务端说没登录'}），请重新扫码登录。", Fore.RED)
+        else:
+            c(f"  没能确认（{state} {detail or ''}），可能是网络问题，稍后再试。", Fore.YELLOW)
+        log(f"登录态检查: {state} {detail}")
+        return state == "ok"
+    except Exception as e:
+        c(f"  检查出错: {str(e)[:120]}", Fore.RED)
+        log(f"登录态检查异常: {e}")
+        return False
     finally:
         if browser:
             try:
@@ -955,6 +974,8 @@ def main():
                 c("  无效输入（请输入 1 或 2）", Fore.RED)
         elif choice == "5":
             asyncio.run(test_once(cfg.get("region", 8)))
+        elif choice == "6":
+            asyncio.run(check_login_only())
         elif choice == "0":
             break
         else:
