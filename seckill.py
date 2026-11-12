@@ -232,9 +232,9 @@ SESSION_PROFILES = {
     # 有成功记录的规模；给 55 才能让下午场首发真的到 50。按 cap=30/50 写，开窗瞬间
     # 其实只发出 25/45 条，等于自己少了 5 条头排位置。
     "10:00": {"poll_ms": 15, "duration": 10, "cap_start": 35, "cap_max": CAP_CEIL,
-              "timeout_ms": 2000},
+              "timeout_ms": 2000, "rate_ms": RATE_MS},
     "15:00": {"poll_ms": 12, "duration": 12, "cap_start": 55, "cap_max": 55,
-              "timeout_ms": 3000},
+              "timeout_ms": 3000, "rate_ms": RATE_MS},
 }
 
 # 隔多久看一次页面里攒下的返回结果（毫秒）。
@@ -259,10 +259,30 @@ DURATION_SEC = 10
 # （15:00 场窗口比一个往返还短，补发本来就不工作）。
 FIRE_TIMEOUT_MS = 2000
 
+# 瞬时发送速率上限（条/秒）。**这是本次最关键的一个数，比并发上限更重要。**
+#
+# 依据（全部来自 issues 里的实战日志，四组数据一个方向）：
+#   · #10 成功那场：开窗后 0.6s 才铺开，速率被回流自然压在 32~58 条/秒
+#     → 往返全程稳定，穿透率 24%，3 条进建单，成功
+#   · #15b 失败那场：开窗前 125ms 放开全速，0.2 秒 burst 45 条 = 225 条/秒
+#     → 往返从 125ms 暴涨到 538ms（4 倍），服务端开始惩罚，之后 12 秒只爬出
+#       9 条/秒，18 条穿透全是 1100205（活动层排队），零条进建单
+#   · #16 那场 97 条/秒持续 burst → 360 条 100% 408，账号被打进风控
+#   · 11-11 本地测试 526 条/秒 → 全部 408
+#
+# 结论：服务端对单账号有瞬时速率闸门（约 60~100 条/秒的量级），超过就惩罚，
+# 且惩罚有惯性（一旦触发整场都在还债）。所以发送本身要节流：
+# 每秒最多放 RATE_LIMIT 条，一次性 burst 35~55 条的行为从根上砍掉。
+#
+# 取 40：压在 #10 成功节奏（32~58）的中间偏下，离闸门留足余量。
+RATE_LIMIT = 40
+RATE_MS = 1000 // RATE_LIMIT          # 每 RATE_MS 毫秒放行 1 条（令牌桶步长）
+
 # 没有场次概念时（手动抢进行中的场、测试）用这一档，对齐抢到过的那次
 DEFAULT_PROFILE = {"poll_ms": POLL_MS, "duration": DURATION_SEC,
                    "cap_start": 30, "cap_max": CAP_CEIL,
-                   "timeout_ms": FIRE_TIMEOUT_MS}
+                   "timeout_ms": FIRE_TIMEOUT_MS,
+                   "rate_ms": RATE_MS}
 
 
 def calc_pre_fire(rtt_ms):
@@ -1281,7 +1301,7 @@ FIRE_JS = """
     const st = window.__sk || (window.__sk = {
         inflight: 0, fired: 0, done: 0, codes: {}, msgs: {},
         hit: null, fatal: null, stopped: false, last: null, rtt: null,
-        regions: {}, ptr: 0, dts: [],
+        regions: {}, ptr: 0, dts: [], lastFire: 0,
     });
 
     // 轮动抢。**注意别把这里当成结论**：quota 确实以 region_id 为键返回，各地域各有
@@ -1298,7 +1318,7 @@ FIRE_JS = """
         st.inflight = 0; st.fired = 0; st.done = 0;
         st.codes = {}; st.msgs = {};
         st.hit = null; st.fatal = null; st.stopped = false; st.last = null;
-        st.rtt = null; st.ptr = 0; st.regions = {}; st.dts = [];
+        st.rtt = null; st.ptr = 0; st.regions = {}; st.dts = []; st.lastFire = 0;
         rids.forEach(rid => {
             st.regions[rid] = {sent: 0, done: 0, last: null, sold: false,
                                sold_at: null, codes: {}};
@@ -1325,7 +1345,21 @@ FIRE_JS = """
     }
 
     let n = 0;
-    while (n < params.batch && st.inflight < params.cap && !st.stopped && !st.hit && !st.fatal) {
+    // 令牌桶节流：一次性 burst 是被实战否定的行为（见 RATE_LIMIT 注释）。
+    // 每次 evaluate 先按「距上次发车攒出来的时间」换算令牌数，最多攒 3 个：
+    // 上限 3 是防「evaluate 被卡了几百毫秒后一口气放一大串」；探针阶段
+    // rate_ms 传 0 表示不限（探针本身每 200ms 才 1 条）。
+    let tokens = 1e9;
+    if (params.rate_ms > 0) {
+        const now = Date.now();
+        if (!st.lastFire) { st.lastFire = now; tokens = 1; }
+        else {
+            tokens = Math.min(Math.floor((now - st.lastFire) / params.rate_ms), 3);
+            if (tokens > 0) st.lastFire = now;
+        }
+    }
+    while (n < params.batch && tokens > 0 && st.inflight < params.cap
+           && !st.stopped && !st.hit && !st.fatal) {
         const rid = pickRegion();
         if (rid === null) {
             // 所有地域都售罄了。要等在飞的回来再确认，别在还有可能成功时提前收手
@@ -1344,7 +1378,7 @@ FIRE_JS = """
             preview: params.preview,
         });
 
-        st.inflight++; st.fired++; n++;
+        st.inflight++; st.fired++; n++; tokens--;
         st.regions[rid].sent++;
         const t0 = Date.now();       // 用来量往返：开窗前的提前量按这个现算
         // 超时兜底：服务端限流时会把请求 hold 住（既不给响应也不断开），
@@ -1442,6 +1476,7 @@ async def rapid_purchase(page, goods, duration=None, open_in=None, regions=None,
     prof = dict(profile or DEFAULT_PROFILE)
     poll_ms = int(prof.get("poll_ms") or POLL_MS)
     timeout_ms = int(prof.get("timeout_ms") or FIRE_TIMEOUT_MS)
+    rate_ms = int(prof.get("rate_ms") or RATE_MS)
     if duration is None:
         duration = float(prof.get("duration") or DURATION_SEC)
 
@@ -1486,10 +1521,12 @@ async def rapid_purchase(page, goods, duration=None, open_in=None, regions=None,
     if len(use_regions) > 1:
         log(f"开始抢购：轮动 {len(use_regions)} 个地域 {use_regions}，"
             f"在途 {cap_base} 起、最多 {cap_max}（按实测吞吐自动加），"
+            f"限速 {1000 // rate_ms} 条/秒，"
             f"每 {poll_ms}ms 看一次结果，持续 {duration:g}s")
         log("  某个地域售罄只摘掉它，其余继续；全部售罄才停")
     else:
         log(f"开始抢购：在途 {cap_base} 起、最多 {cap_max}（按实测吞吐自动加），"
+            f"限速 {1000 // rate_ms} 条/秒，"
             f"每 {poll_ms}ms 看一次结果，持续 {duration:g}s")
 
     params = {
@@ -1509,6 +1546,7 @@ async def rapid_purchase(page, goods, duration=None, open_in=None, regions=None,
         # 售罄不放进 norety：它只摘地域，全部摘完才由 JS 判本场结束
         "norety": sorted(NO_RETRY_CODES - {CODE_SOLD_OUT}),
         "timeout_ms": int(timeout_ms),   # 单条超时，见 FIRE_TIMEOUT_MS 的说明
+        "rate_ms": int(rate_ms),         # 令牌桶步长，见 RATE_LIMIT 的说明
         "reset": True,
         "stop": False,
     }
@@ -1554,10 +1592,10 @@ async def rapid_purchase(page, goods, duration=None, open_in=None, regions=None,
                 left = open_at - now
                 rtt_txt = f"{rtt}ms" if rtt else "还没量到"
                 if left > 0:
-                    log(f"  开窗前 {pre_fire:.0f}ms 放开全速"
-                        f"（实测往返 {rtt_txt}，距开窗 {left:.2f}s）")
+                    log(f"  开窗前 {pre_fire:.0f}ms 铺开（限速 {1000 // rate_ms} 条/秒，"
+                        f"实测往返 {rtt_txt}，距开窗 {left:.2f}s）")
                 else:
-                    log(f"  开窗了，全速发（实测往返 {rtt_txt}）")
+                    log(f"  开窗了，按限速 {1000 // rate_ms} 条/秒铺开（实测往返 {rtt_txt}）")
             else:
                 params["cap"] = min(PROBE_CAP, int(cap_now))
                 params["batch"] = 1
