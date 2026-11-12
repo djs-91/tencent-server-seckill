@@ -129,9 +129,11 @@ async def _check_login(page):
     """, VIP_URL)
     state = _login_state(r)
     if state == "csrf":
-        # 再抓一次 csrf 重试一次，能把相当一部分"假失效"直接救回来
+        # 换成**当前** skey 重算 csrf 再试一次。
+        # 这里必须 force：扫码后 skey 已换新，但 window.__latestCsrf 还是
+        # 登录前抓到的旧 token，不强制重算的话重试多少次都是 CSRF-ERROR。
         await asyncio.sleep(0.4)
-        await sf.ensure_csrf(page)
+        await sf.ensure_csrf(page, force=True)
         r2 = await page.evaluate("""
             (url) => fetch(url, {method:'POST',
                 headers:{'Content-Type':'application/json','x-csrf-token':window.__latestCsrf||''},
@@ -296,21 +298,31 @@ async def do_login():
                     ok = True
                     break
 
-                # 这里曾经直接判成功：「有 skey/uin + 服务端回 CSRF-ERROR = 已登录」。
-                # 这个假设是错的。issue #13 实测：08:58:44 判"已登录"，
-                # 08:58:53 复验就 not-logged —— 假成功让人以为登好了，开抢时
-                # 又报"登录态已失效"，于是重扫、再假成功，死循环。
-                # 现在：不在当场下结论，先存下来交给后面的复验裁决
-                # （复验不过会把 ok 置回 False），既不假成功也不干等超时。
-                if state == "csrf" and has_cookie:
-                    ok = True
-                    log("服务端返回 CSRF-ERROR 且已有 skey/uin：先存下来，以复验结果为准")
-                    break
-
+                # 【教训】这里曾经加过一条判据：「有 skey/uin + 服务端回
+                # CSRF-ERROR = 已登录」。它是 6cea7e9 引入的，也是这次
+                # 「扫码怎么都登不上」的根源之一，已彻底删除。
+                #
+                # CSRF-ERROR 的真实含义是「请求带的 csrf 与当前 skey 对不上」。
+                # 三方实测（_verify/probe_stale_csrf.py）：带对 token 返回
+                # code=0；token 错/空返回 CSRF-ERROR；连 skey 都没有才是
+                # NOT-LOGINED。它既不是"已登录"，也不是"等一会儿就好"，而
+                # 是必须拿**当前** skey 重算 token 才能消掉的状态。
+                #
+                # 在这个状态存 state，服务端不认：issue #13 实测 08:58:44 判
+                # "已登录"、08:58:53 复验就 not-logged；本地 13:15 复现同样结果。
+                # 假成功会让用户以为登好了，开抢时又报"登录态已失效"，于是
+                # 重扫、再假成功，形成死循环——这正是大家反馈的现象。
+                #
+                # 所以判据回到唯一可靠的那一条：服务端 get-vip-info 明确返回
+                # code=0。csrf 不在这里特殊处理，由 _check_login 内部强制重算
+                # token 后重试来消解。
                 if has_cookie and not hinted:
                     hinted = True
-                    c("已检测到扫码，但服务端还不认。请在手机上点【确认登录】。", Fore.YELLOW)
-                    log(f"有 skey/uin 但服务端返回 {state}，等用户在手机上确认")
+                    if state == "csrf":
+                        c("已检测到扫码，正在建立登录态…请在手机上点【确认登录】。", Fore.YELLOW)
+                    else:
+                        c("已检测到扫码，但服务端还不认。请在手机上点【确认登录】。", Fore.YELLOW)
+                    log(f"有 skey/uin 但服务端返回 {state}，继续等用户在手机上确认")
             except Exception as e:
                 log(f"检测异常: {e}")
 

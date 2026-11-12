@@ -629,13 +629,30 @@ def attach_csrf_sniffer(page):
     return page
 
 
-async def ensure_csrf(page):
+async def ensure_csrf(page, force=False):
     """保证 window.__latestCsrf 有值。
 
     顺序：页面自己的 -> 协议层嗅探到的 -> 从 cookie 现算 g_tk。
     拿不到就返回 None，调用方不要拿空 token 硬发请求（空 token 会换来
     400 CSRF-ERROR，再被误判成登录失效，这才是"反复要求扫码"的根源）。
+
+    force=True：不信页面缓存，强制按当前 skey 用 g_tk 重算。
+    扫码登录后 skey 会换新，而 window.__latestCsrf 里存的是登录**前**
+    （匿名时）的旧 token。页面若没自行刷新，旧 token 就一直在，请求会被
+    回 CSRF-ERROR，登录检测永远等不到 code=0 —— 这就是"扫完码怎么都
+    登不上"的根因。13:08 那次能成功纯属页面碰巧自己刷新了。
     """
+    if force:
+        calc = await _csrf_from_skey(page)
+        if calc:
+            try:
+                await page.evaluate("(v) => { window.__latestCsrf = v; }", calc)
+            except Exception:
+                pass
+            return calc
+        # 重算不出来（页面里没 skey）就用嗅探到的，仍是拿不到才返回 None
+        return getattr(page, "_csrf_sniff", None)
+
     try:
         cur = await page.evaluate("() => window.__latestCsrf || null")
         if cur:
@@ -652,8 +669,25 @@ async def ensure_csrf(page):
         return sniffed
 
     # 最后兜底：按前端的 g_tk 算法，从 skey/p_skey 现算一个
+    calc = await _csrf_from_skey(page)
+    if calc:
+        try:
+            await page.evaluate("(v) => { window.__latestCsrf = v; }", calc)
+        except Exception:
+            pass
+        return calc
+    return None
+
+
+async def _csrf_from_skey(page):
+    """在页面里读 document.cookie 的 skey/p_skey，按腾讯前端 g_tk 算法算出
+    csrf token。实测与页面自己发出的 x-csrf-token 完全一致（2120550790）。
+
+    skey 的 httpOnly=False，所以 JS 能读到；万一读不到返回 None，调用方
+    自行降级，绝不拿空 token 去请求。
+    """
     try:
-        calc = await page.evaluate("""
+        return await page.evaluate("""
             () => {
                 const cs = (document.cookie || '').split(';');
                 let skey = null;
@@ -669,15 +703,8 @@ async def ensure_csrf(page):
                 return String(2147483647 & e);
             }
         """)
-        if calc:
-            try:
-                await page.evaluate("(v) => { window.__latestCsrf = v; }", calc)
-            except Exception:
-                pass
-            return calc
     except Exception:
-        pass
-    return None
+        return None
 
 
 async def _report_state_cookies(ctx):
