@@ -14,9 +14,10 @@
   - 真正容易出问题的是两个时机/判定：
     (1) 扫码成功后 cookie 有几秒延迟，存早了就是一份没有 skey 的空壳；
         -> 用 _wait_login_cookies() 等 skey 落地再存。
-    (2) 服务端先验 csrf 再验登录，csrf 不对时回 400 CSRF-ERROR。
-        这只说明 csrf 没带对，**不代表没登录**（真没登录是 200 NOT-LOGINED）。
-        把它当失效就会反复逼人重扫码 -> _login_state() 把 csrf 单独归类。
+    (2) 扫码后 skey 会换新，而页面里缓存的 csrf 还是登录**前**的旧 token，
+        服务端于是回 CSRF-ERROR。它既不是"已登录"，也不是"失效"，而是必须
+        拿当前 skey 用 g_tk 重算才能消掉的状态 -> _check_login() 里 force 重算。
+        在这个状态存 state 服务端不认（issue #13 的假成功就是这么来的）。
 免责声明: 仅供个人学习使用；自动化抢购可能违反活动规则，
 可能致账号限流/受限，风险自担；请勿高频滥用。
 """
@@ -90,10 +91,13 @@ def _login_state(r):
     不能只看 code != 'NOT-LOGINED'：请求失败时前端 fetch 会被 catch 成
     {code: -1}，那不等于 NOT-LOGINED，判成"登录成功"就会误报。
 
-    重点：CSRF-ERROR 必须单独成一类。
-    服务端先验 csrf 再验登录，csrf 不对时回 400 CSRF-ERROR —— 这恰恰说明
-    cookie 是**有效**的（无效会是 200 NOT-LOGINED）。以前把它归到 not-logged，
-    于是登录态好好的却被判失效，反复逼用户重扫码，这就是"扫三次才好一次"的成因。
+    CSRF-ERROR 单独成一类，但它**不代表已登录**。三方实测：
+      带对 csrf  -> code=0
+      csrf 陈旧/错误 -> CSRF-ERROR
+      连 skey 都没有 -> NOT-LOGINED
+    它的意思是「请求带的 csrf 与当前 skey 对不上」，必须拿当前 skey 重算
+    token 才能消掉（见 _check_login 的 force 重算）。既不能判成功（会存下
+    假登录态），也不能判失效（会逼人白重扫）。
     """
     if not isinstance(r, dict) or "code" not in r:
         return "unknown"
@@ -101,17 +105,23 @@ def _login_state(r):
     if code is None or isinstance(code, bool):
         return "unknown"
     if isinstance(code, (int, float)):
-        return "not-logged" if code < 0 else "ok"
+        # 只认 0 为成功。正数可能是业务码（1100205 系统繁忙、408 限流、
+        # 200 这种 HTTP 风格值），以前一律判 ok，等于把"系统繁忙"当成
+        # "登录成功"—— 这是假成功的另一个入口，必须堵掉。
+        if code == 0:
+            return "ok"
+        return "not-logged" if code < 0 else "unknown"
     text = str(code).strip().upper()
     if not text:
         return "unknown"
     if "CSRF" in text:
-        return "csrf"          # csrf 没带对，不代表没登录
+        return "csrf"          # token 对不上，skey 其实在
     if text in _NOT_LOGGED_CODES:
         return "not-logged"
-    if text in _OK_CODES or text.isdigit():
+    if text in _OK_CODES or text == "0":
         return "ok"
-    return "not-logged"
+    # 不认识的码一律 unknown：既不报成功（防假成功），也不报失效（防误逼重扫）
+    return "unknown"
 
 
 async def _check_login(page):
@@ -337,9 +347,17 @@ async def do_login():
                 # 用存下来的这份 state 重新开一次，服务端认了才算真的登录。
                 # 绝不能"存下来就算成功"：issue #13 就是这样假成功的——
                 # 打印了"登录成功"，9 秒后复验却是 not-logged。
+                #
+                # 复验必须用**独立的无头浏览器**，不能复用上面那个有头 browser：
+                # 有头模式下 browser.new_context() 会真的新开一个窗口，用户刚在
+                # 手机上确认完登录，桌面上就莫名多出一个窗口（约 9 秒后才关），
+                # 很容易以为程序出岔子了。无头浏览器看不到窗口，验证效果一样。
                 re_state = None
+                vheadless = None
                 try:
-                    vctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
+                    vheadless = await sf.launch_browser(pw, headless=True)
+                    vctx = await vheadless.new_context(storage_state=str(STATE_PATH), user_agent=UA)
+                    await vctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
                     await vctx.add_init_script(sf.CSRF_HOOK_JS)
                     vpage = await vctx.new_page()
                     sf.attach_csrf_sniffer(vpage)
@@ -350,6 +368,12 @@ async def do_login():
                     await vctx.close()
                 except Exception as e:
                     c(f"复验出错: {e}", Fore.YELLOW)
+                finally:
+                    if vheadless:
+                        try:
+                            await vheadless.close()
+                        except Exception:
+                            pass
 
                 if re_state == "ok":
                     c(f"登录成功，登录态已保存（{desc}）", Fore.GREEN)
@@ -408,8 +432,10 @@ async def ensure_login():
 
     判定原则（很重要，关系到会不会白让人扫码）：
       只有服务端明确回 NOT-LOGINED 才算失效。
-      CSRF-ERROR / 请求异常 都**不能**作为"失效"的依据 —— 前者恰恰证明 cookie 有效，
-      后者只是网络抖了。把这两类当失效，就是"明明登录着还被逼着重扫"的根源。
+      CSRF-ERROR / unknown / 请求异常 都不作为"失效"依据：前者是 token 对不上
+      （skey 其实在，_check_login 内部会 force 重算），中者是没见过的返回码，
+      后者只是网络抖了。把它们当失效，就是"明明登录着还被逼着重扫"的根源。
+      反过来也绝不判成功——成功只认 code=0，其余一律不报"登好了"。
     """
     if not STATE_PATH.exists():
         c("未找到登录态，首次使用需要先扫码登录", Fore.RED)
