@@ -296,19 +296,21 @@ async def do_login():
                     ok = True
                     break
 
-                # CSRF-ERROR 只在已登录时出现（匿名是 NOT-LOGINED），
-                # 所以「有 cookie + 回 CSRF-ERROR」= 确实登着，只是 csrf 没对上。
+                # 这里曾经直接判成功：「有 skey/uin + 服务端回 CSRF-ERROR = 已登录」。
+                # 这个假设是错的。issue #13 实测：08:58:44 判"已登录"，
+                # 08:58:53 复验就 not-logged —— 假成功让人以为登好了，开抢时
+                # 又报"登录态已失效"，于是重扫、再假成功，死循环。
+                # 现在：不在当场下结论，先存下来交给后面的复验裁决
+                # （复验不过会把 ok 置回 False），既不假成功也不干等超时。
                 if state == "csrf" and has_cookie:
                     ok = True
-                    log("服务端返回 CSRF-ERROR 且已有 skey/uin：说明已登录，仅 csrf 未对齐")
+                    log("服务端返回 CSRF-ERROR 且已有 skey/uin：先存下来，以复验结果为准")
                     break
 
                 if has_cookie and not hinted:
                     hinted = True
                     c("已检测到扫码，但服务端还不认。请在手机上点【确认登录】。", Fore.YELLOW)
                     log(f"有 skey/uin 但服务端返回 {state}，等用户在手机上确认")
-            except Exception as e:
-                log(f"检测异常: {e}")
             except Exception as e:
                 log(f"检测异常: {e}")
 
@@ -319,9 +321,11 @@ async def do_login():
                 log("12 秒内没等到完整登录 cookie（skey/uin）")
             saved, desc = await _save_state(ctx)
             if saved:
-                c(f"登录成功，登录态已保存（{desc}）", Fore.GREEN)
                 log(f"state 已保存：{desc}")
-                # 用存下来的这份 state 重新开一次，能过才算真的存对了
+                # 用存下来的这份 state 重新开一次，服务端认了才算真的登录。
+                # 绝不能"存下来就算成功"：issue #13 就是这样假成功的——
+                # 打印了"登录成功"，9 秒后复验却是 not-logged。
+                re_state = None
                 try:
                     vctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
                     await vctx.add_init_script(sf.CSRF_HOOK_JS)
@@ -332,16 +336,27 @@ async def do_login():
                     await _wait_csrf(vpage, tries=25)
                     re_state, _ = await _check_login(vpage)
                     await vctx.close()
-                    if re_state == "ok":
-                        log("state 复验通过（重启后可直接沿用）")
-                    elif re_state == "csrf":
-                        c("复验时 csrf 没取到，但不代表登录态坏了；重启后仍可能直接可用", Fore.YELLOW)
-                        log("state 复验：CSRF-ERROR（cookie 有效，仅 csrf 未同步）")
-                    else:
-                        c("复验没过，登录态可能没存全。本次抢购请勿关闭浏览器。", Fore.YELLOW)
-                        log(f"state 复验没过: {re_state}")
                 except Exception as e:
-                    c(f"复验出错: {e}（已保存的登录态不受影响）", Fore.YELLOW)
+                    c(f"复验出错: {e}", Fore.YELLOW)
+
+                if re_state == "ok":
+                    c(f"登录成功，登录态已保存（{desc}）", Fore.GREEN)
+                    log("state 复验通过（重启后可直接沿用）")
+                elif re_state == "csrf":
+                    c(f"登录态未能确认（csrf 未对齐），已保存 {desc}", Fore.YELLOW)
+                    c("  建议再执行一次 [2] 确认；开抢前也会自动复验。", Fore.WHITE)
+                    log("state 复验：CSRF-ERROR，未能确认登录")
+                    ok = False
+                elif re_state is None:
+                    c(f"登录态已保存（{desc}），但复验没跑成，未能确认。", Fore.YELLOW)
+                    log("state 复验未执行")
+                    ok = False
+                else:
+                    c(f"登录没有成功：服务端仍返回未登录（{re_state}）", Fore.RED)
+                    c("  存下来的 cookie 服务端不认，请重新扫码。", Fore.WHITE)
+                    c("  扫码后一定要在手机上点【确认登录】。", Fore.WHITE)
+                    log(f"state 复验没过: {re_state}")
+                    ok = False
             else:
                 # 关键：不再假报"已保存"。存不全就明说，并给出可执行的建议。
                 c(f"扫码成功，但登录态没能完整保存（{desc}）", Fore.YELLOW)
