@@ -231,8 +231,10 @@ SESSION_PROFILES = {
     # 能打出去的是 cap − 探针在途。给 35 才能让开窗那一刻真的发出 30 条 —— 30 是唯一
     # 有成功记录的规模；给 55 才能让下午场首发真的到 50。按 cap=30/50 写，开窗瞬间
     # 其实只发出 25/45 条，等于自己少了 5 条头排位置。
-    "10:00": {"poll_ms": 15, "duration": 10, "cap_start": 35, "cap_max": CAP_CEIL},
-    "15:00": {"poll_ms": 12, "duration": 12, "cap_start": 55, "cap_max": 55},
+    "10:00": {"poll_ms": 15, "duration": 10, "cap_start": 35, "cap_max": CAP_CEIL,
+              "timeout_ms": 2000},
+    "15:00": {"poll_ms": 12, "duration": 12, "cap_start": 55, "cap_max": 55,
+              "timeout_ms": 3000},
 }
 
 # 隔多久看一次页面里攒下的返回结果（毫秒）。
@@ -244,9 +246,23 @@ POLL_MS = 15
 # 持续发送时间 (秒)，默认档用；各场次档位里另有自己的值
 DURATION_SEC = 10
 
+# 单条请求的超时（毫秒）。**没有它整个抢购会在中途停摆。**
+#
+# 服务端限流时会把请求 hold 住：既不给响应，也不断开连接。而 FIRE_JS 里
+# inflight 只在 then/catch 里减，挂住的请求永远不减 -> "inflight < cap"
+# 再也不成立 -> 一条都发不出去，直到那些请求自己回来（实测可能一直不回来）。
+# 11-12 10:00 场实测：35 条挂死，之后 6 秒只发出 27 条，总速率从 25/秒掉到 16/秒。
+#
+# 各场次给不同值：10:00 场正常往返 100~900ms，2000ms 很宽容；
+# 15:00 场单条本来就 1.76~2.5 秒（见 SESSION_PROFILES），设短了会误杀正常响应，
+# 所以给 3000ms —— 它在那儿只负责防"永久挂死"，不指望靠它抢补发
+# （15:00 场窗口比一个往返还短，补发本来就不工作）。
+FIRE_TIMEOUT_MS = 2000
+
 # 没有场次概念时（手动抢进行中的场、测试）用这一档，对齐抢到过的那次
 DEFAULT_PROFILE = {"poll_ms": POLL_MS, "duration": DURATION_SEC,
-                   "cap_start": 30, "cap_max": CAP_CEIL}
+                   "cap_start": 30, "cap_max": CAP_CEIL,
+                   "timeout_ms": FIRE_TIMEOUT_MS}
 
 
 def calc_pre_fire(rtt_ms):
@@ -473,6 +489,7 @@ CODE_DESC = {
     CODE_NO_PERMISSION: "账号没有创建实例的权限（子账号未授权 / 未实名 / 欠费）",
     CODE_NOT_PAID: "有同款未支付订单占着限购配额？先去控制台看订单（此码语义待实测确认）",
     -1: "请求没发出去（网络断了或页面上下文没了）",
+    -2: "请求超时被主动放弃（服务端把请求挂住了，释放在途槽位后继续发）",
 
     # ---- 以下为 2026-11-10 22:11 登录态下一手实测到的码（附服务端原话）----
     # 实测方式：do-goods preview=1，不产生订单
@@ -1330,13 +1347,22 @@ FIRE_JS = """
         st.inflight++; st.fired++; n++;
         st.regions[rid].sent++;
         const t0 = Date.now();       // 用来量往返：开窗前的提前量按这个现算
+        // 超时兜底：服务端限流时会把请求 hold 住（既不给响应也不断开），
+        // 而 inflight 只在 then/catch 里减 —— 没有超时的话这些请求会永久占着
+        // 槽位，`inflight < cap` 再也不成立，整场就发不动了（实测空转 6 秒）。
+        // 超时就 abort，让 catch 分支把 inflight 还回去，槽位继续转。
+        const ctl = new AbortController();
+        const tmo = setTimeout(() => { try { ctl.abort(); } catch (e) {} },
+                               (params.timeout_ms || 2000));
         fetch(params.url, {
             method: 'POST',
             headers: {'Content-Type': 'application/json',
                       'x-csrf-token': window.__latestCsrf || ''},
             credentials: 'include',
             body: body,
+            signal: ctl.signal,
         }).then(r => r.json()).then(d => {
+            clearTimeout(tmo);
             st.inflight--; st.done++;
             const dt = Date.now() - t0;
             if (st.rtt === null || dt < st.rtt) st.rtt = dt;
@@ -1368,10 +1394,19 @@ FIRE_JS = """
             if (c === params.ok && !st.hit) st.hit = d;
             if (params.norety.indexOf(c) >= 0 && !st.fatal) st.fatal = c;
         }).catch(e => {
+            clearTimeout(tmo);
             st.inflight--; st.done++;
-            st.last = -1;
-            st.codes[-1] = (st.codes[-1] || 0) + 1;
-            if (!st.msgs[-1]) st.msgs[-1] = String((e && e.message) || e).slice(0, 60);
+            // 把「超时主动放弃」和「请求真的没发出去」分开统计：
+            // 前者是释放槽位的正常动作（服务端 hold 住我们），后者是网络/页面故障。
+            // 混成一个码会让日志看不出到底是被服务端挂住还是自己网络断了。
+            const aborted = !!(e && (e.name === 'AbortError'
+                                     || String(e).toLowerCase().indexOf('abort') >= 0));
+            const code = aborted ? -2 : -1;
+            st.last = code;
+            st.codes[code] = (st.codes[code] || 0) + 1;
+            if (!st.msgs[code]) st.msgs[code] = aborted
+                ? '请求超时被放弃（释放槽位后继续发）'
+                : String((e && e.message) || e).slice(0, 60);
         });
     }
     return {fired: st.fired, inflight: st.inflight, done: st.done,
@@ -1406,6 +1441,7 @@ async def rapid_purchase(page, goods, duration=None, open_in=None, regions=None,
     """
     prof = dict(profile or DEFAULT_PROFILE)
     poll_ms = int(prof.get("poll_ms") or POLL_MS)
+    timeout_ms = int(prof.get("timeout_ms") or FIRE_TIMEOUT_MS)
     if duration is None:
         duration = float(prof.get("duration") or DURATION_SEC)
 
@@ -1472,6 +1508,7 @@ async def rapid_purchase(page, goods, duration=None, open_in=None, regions=None,
         "reset_rtt": False,    # 换了在途数就置 True，让页面把往返样本清空重采
         # 售罄不放进 norety：它只摘地域，全部摘完才由 JS 判本场结束
         "norety": sorted(NO_RETRY_CODES - {CODE_SOLD_OUT}),
+        "timeout_ms": int(timeout_ms),   # 单条超时，见 FIRE_TIMEOUT_MS 的说明
         "reset": True,
         "stop": False,
     }
@@ -1661,16 +1698,27 @@ async def rapid_purchase(page, goods, duration=None, open_in=None, regions=None,
                             log(f"  在途 加到 {cap_now}（当前往返 {rtt_med:.0f}ms，"
                                 f"上限 {cap_max}；一个往返后看吞吐跟不跟得上）")
                     elif action == "saturated":
-                        # 加了在途、吞吐没跟上 → 服务端饱和。退回加之前的值并锁死，
-                        # 抢购窗口只有几秒，反复试探等于烧掉机会。
+                        # 加了在途、吞吐没跟上 → 服务端饱和，本场不再往上试。
                         adapt_saturated = True
-                        cap_base = new_cap
-                        cap_now = cap_base
-                        params["cap"] = int(cap_now)
-                        params["batch"] = int(cap_now)
-                        params["reset_rtt"] = True
-                        log(f"  在途 退回 {cap_now}：加了在途吞吐没跟着涨"
-                            f"（往返 {rtt_med:.0f}ms），服务端已饱和，本场不再往上试")
+                        # 但**不能无条件立刻降**：如果此刻在飞数已经超过新上限，
+                        # 降下去会让 `inflight < cap` 再也不成立，新请求一条都发不出去。
+                        # 日志实证（11-12）：
+                        #   lzj664270555 10:00 场：cap 52 退到 35 时 inflight 正好 35，
+                        #     之后 6 秒只发出 27 条，总速率从 25/秒 掉到 16/秒
+                        #   cstcood 那场：inflight 64 退到 30，1 秒后本场就结束了
+                        # 所以先维持当前上限，等挂住的请求回落（现在有超时兜底了）再降。
+                        cur_inflight = int(result.get("inflight") or 0)
+                        if cur_inflight > new_cap:
+                            log(f"  在途 暂不退回 {new_cap}：当前还有 {cur_inflight} 条在飞，"
+                                f"降下去会发不出新请求，先维持 {cap_now}")
+                        else:
+                            cap_base = new_cap
+                            cap_now = cap_base
+                            params["cap"] = int(cap_now)
+                            params["batch"] = int(cap_now)
+                            params["reset_rtt"] = True
+                            log(f"  在途 退回 {cap_now}：加了在途吞吐没跟着涨"
+                                f"（往返 {rtt_med:.0f}ms），服务端已饱和，本场不再往上试")
                     elif action == "hold" and last_adapt_log != "hold":
                         last_adapt_log = "hold"
                         log(f"  在途停在 {cap_now}（已到本场上限）")
@@ -1739,6 +1787,8 @@ async def rapid_purchase(page, goods, duration=None, open_in=None, regions=None,
                 return "成功"
             if k == -1:
                 return "没发出去"
+            if k == -2:
+                return "超时放弃"
             return str(k)
         parts = sorted(tally.items(), key=lambda kv: -kv[1])
         pieces = []
@@ -1747,6 +1797,17 @@ async def rapid_purchase(page, goods, duration=None, open_in=None, regions=None,
             msg = str(msgs.get(k) or msgs.get(str(k)) or "").strip()
             pieces.append(f"{_label(k)}×{v}" + (f"（{msg}）" if msg else ""))
         log("  各码次数: " + ", ".join(pieces))
+
+        # 超时是客户端单方面放弃，服务端可能还在处理 —— 极端情况下会留下
+        # 「幽灵订单」：我们没收到成功回包，但服务端其实建了单。
+        # 所以只要本场有超时，就必须提醒去核对，不能默认"没抢到"。
+        def _cnt(*keys):
+            return sum(int(tally.get(k) or 0) for k in keys)
+        n_timeout = _cnt(-2, "-2")
+        if n_timeout > 0 and not success:
+            log(f"  !! 本场有 {n_timeout} 条请求超时后被放弃。")
+            log("     超时只是客户端不等了，服务端可能仍在处理。")
+            log("     建议去控制台订单页核对一眼，有没有多出来的未支付订单，有就取消。")
 
     # 分地域战况：轮动模式下最该看的就是这个——
     # 哪个地域先售罄、哪个地域一条都没发出去、额度是不是被摊平了
