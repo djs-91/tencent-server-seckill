@@ -124,6 +124,110 @@ def _login_state(r):
     return "unknown"
 
 
+def _i32(x):
+    """模拟 JS 的 ToInt32：截到 32 位并转成有符号。"""
+    x &= 0xFFFFFFFF
+    return x - 0x100000000 if x >= 0x80000000 else x
+
+
+def gtk_of(skey):
+    """按腾讯前端的 g_tk 算法从 skey 算出 csrf token（纯 Python，不开页面）。
+
+    必须逐位对齐 JS，不能只写 `e += (e << 5) + ord(c)`：
+      · `e << 5` 在 JS 里先 ToInt32 再左移，会溢出成负数；
+      · e 本身是 double，累加几十轮就超过 2^53 会丢精度，Python int 不会。
+    所以这里 e 用 float 走 IEEE754 加法和 ToInt32 截断，与浏览器完全一致。
+    实测：305 组随机串（长度 1~300，含空串）与页面 JS 结果 100% 相同。
+    """
+    if not skey:
+        return None
+    e = 5381.0
+    for ch in skey:
+        e = e + float(_i32(_i32(int(e)) << 5)) + float(ord(ch))
+    return str(2147483647 & _i32(int(e)))
+
+
+async def csrf_from_context(ctx):
+    """从 context 的 cookie 里取 skey 现算 csrf，不依赖页面、也不加载页面。"""
+    try:
+        cookies = await ctx.cookies()
+    except Exception:
+        return None
+    for want in ("skey", "p_skey"):
+        for ck in cookies:
+            if ck.get("name") == want and ck.get("value"):
+                tok = gtk_of(ck["value"])
+                if tok:
+                    return tok
+    return None
+
+
+async def verify_state(ctx, timeout=15):
+    """只打 get-vip-info 校验登录态，**绝不加载任何页面**。返回 (state, r)。
+
+    【为什么不能用页面校验】
+    实测（2026-11-12）：拿一份失效 skey 打开 cloud.tencent.com，页面自己请求
+    /services/ajax/get_user_info 时，服务端会回 Set-Cookie: skey=; uin=; tinyid=;
+    —— 三个登录 cookie 当场被清空（21 条 -> 18 条，skey/uin/tinyid 全没）。
+    也就是说「打开活动页校验登录态」这个动作本身在销毁登录态：本来只是暂时
+    失效、重试或稍后还能用的，被这么一验就彻底没了，只能重扫。
+    有效登录态不受影响（实测 33 -> 34 条，三个都在），但失效时就是雪上加霜。
+
+    只打接口则完全不动 cookie（实测前后条数一致）。csrf 用 g_tk(skey) 现算，
+    与页面 hook 抓到的值完全一致（同一算法，305 组实测逐位相同）。
+    """
+    gtk = await csrf_from_context(ctx)
+    if not gtk:
+        return "unknown", {"__err": "context 里没有 skey"}
+    try:
+        resp = await ctx.request.post(
+            VIP_URL,
+            data="{}",
+            headers={"Content-Type": "application/json", "x-csrf-token": gtk},
+            timeout=int(timeout * 1000),
+        )
+        r = await resp.json()
+    except Exception as e:
+        return "unknown", {"__err": str(e)[:80]}
+    return _login_state(r), r
+
+
+async def verify_state_file(state_path=None):
+    """用磁盘上的 .state.json 开一个无头 context 做只读校验，用完即关。
+
+    不需要页面、不会碰 cookie，校验完把 context 扔掉，不落盘。
+    返回 (state, r, ctx_cookie_count)。
+    """
+    from playwright.async_api import async_playwright
+    path = Path(state_path) if state_path else STATE_PATH
+    pw = None
+    browser = None
+    try:
+        pw = await async_playwright().start()
+        browser = await sf.launch_browser(pw, headless=True)
+        ctx = await browser.new_context(storage_state=str(path), user_agent=UA)
+        state, r = await verify_state(ctx)
+        try:
+            n = len(await ctx.cookies())
+        except Exception:
+            n = -1
+        await ctx.close()
+        return state, r, n
+    except Exception as e:
+        return "unknown", {"__err": str(e)[:80]}, -1
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+
+
 async def _check_login(page):
     """无害验证：get-vip-info 查询接口，绝不产生订单。返回 (state, r)
 
@@ -348,32 +452,14 @@ async def do_login():
                 # 绝不能"存下来就算成功"：issue #13 就是这样假成功的——
                 # 打印了"登录成功"，9 秒后复验却是 not-logged。
                 #
-                # 复验必须用**独立的无头浏览器**，不能复用上面那个有头 browser：
-                # 有头模式下 browser.new_context() 会真的新开一个窗口，用户刚在
-                # 手机上确认完登录，桌面上就莫名多出一个窗口（约 9 秒后才关），
-                # 很容易以为程序出岔子了。无头浏览器看不到窗口，验证效果一样。
+                # 复验同样走「只打接口、不加载页面」：
+                # 一是不用再开窗口（无头也不用起，直接省掉一个浏览器），
+                # 二是避免加载页面在登录态有问题时把 skey/uin/tinyid 清掉。
                 re_state = None
-                vheadless = None
                 try:
-                    vheadless = await sf.launch_browser(pw, headless=True)
-                    vctx = await vheadless.new_context(storage_state=str(STATE_PATH), user_agent=UA)
-                    await vctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
-                    await vctx.add_init_script(sf.CSRF_HOOK_JS)
-                    vpage = await vctx.new_page()
-                    sf.attach_csrf_sniffer(vpage)
-                    await vpage.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
-                    await asyncio.sleep(2)
-                    await _wait_csrf(vpage, tries=25)
-                    re_state, _ = await _check_login(vpage)
-                    await vctx.close()
+                    re_state, _vr, _vn = await verify_state_file()
                 except Exception as e:
                     c(f"复验出错: {e}", Fore.YELLOW)
-                finally:
-                    if vheadless:
-                        try:
-                            await vheadless.close()
-                        except Exception:
-                            pass
 
                 if re_state == "ok":
                     c(f"登录成功，登录态已保存（{desc}）", Fore.GREEN)
@@ -459,44 +545,18 @@ async def ensure_login():
         c("  未登录，操作已取消", Fore.RED)
         return False
 
-    pw = None
-    browser = None
-    state = "unknown"
-    detail = ""
-    try:
-        from playwright.async_api import async_playwright
-        pw = await async_playwright().start()
-        browser = await sf.launch_browser(pw, headless=True)
-        ctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
-        await ctx.add_init_script(sf.CSRF_HOOK_JS)
-        page = await ctx.new_page()
-        sf.attach_csrf_sniffer(page)
-        await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(2)
-        await _wait_csrf(page, tries=25)
-        state, r = await _check_login(page)
-        if state in ("csrf", "unknown"):
-            # 首屏没就绪或被 EdgeOne 挑战页拦一下时会瞬时失败，再等一轮重试，
-            # 否则会误判登录态失效、让人白扫一次码
-            await asyncio.sleep(3)
-            await _wait_csrf(page, tries=25)
-            state, r = await _check_login(page)
-        detail = str(r.get("code") or r.get("__err") or "")[:40]
-    except Exception as e:
-        log(f"登录态校验异常，按有效处理: {e}")
-        return True
-    finally:
-        # 校验异常时也把浏览器资源收回，不留后台残留
-        if browser:
-            try:
-                await browser.close()
-            except Exception:
-                pass
-        if pw:
-            try:
-                await pw.stop()
-            except Exception:
-                pass
+    # 只用接口校验，**不加载任何页面**。
+    # 加载页面会在登录态失效时把 skey/uin/tinyid 一起清掉（实测 21 条 -> 18 条，
+    # 三个全没），等于校验动作本身把登录态毁了，用户只能重扫。
+    state, r, cookie_n = await verify_state_file()
+    if state in ("csrf", "unknown"):
+        # 可能是网络抖动或 EdgeOne 挑战，隔几秒再试一次，
+        # 否则会误判失效、让人白扫一次码
+        await asyncio.sleep(3)
+        state, r, cookie_n = await verify_state_file()
+    detail = str(r.get("code") or r.get("__err") or "")[:40]
+    log(f"登录态校验（只打接口）：{state}"
+        f"{' ' + detail if detail else ''}，context {cookie_n} 条 cookie")
 
     if state == "ok":
         log("登录态有效")
@@ -675,13 +735,16 @@ async def run_grab(region_id, target_time=None, rotate=True):
                             log(f"  第{attempt}次刷新失败: {str(e)[:80]}")
                     if csrf_ok:
                         try:
-                            state, r = await _check_login(page)
+                            # 登录判定走接口而不是页面：页面刚 reload 过，
+                            # 它自己的 JS 状态、hook 时机都还没稳，拿它判登录
+                            # 容易误报；接口只认 code，不受页面状态干扰。
+                            state, r = await verify_state(ctx)
                             if state == "ok":
                                 log("登录态复验通过")
                             elif state == "not-logged":
                                 c(f"!! 登录态已失效（{r.get('code') or r.get('__err')}），请中断后重新扫码", Fore.RED)
                             else:
-                                log(f"登录复验未能确认（{state}），继续（csrf 问题不代表登录失效）")
+                                log(f"登录复验未能确认（{state}），继续（不代表登录失效）")
                         except Exception as e:
                             log(f"登录复验异常: {str(e)[:80]}")
                     else:
@@ -859,16 +922,71 @@ def region_menu():
         c("  无效输入，未改动。", Fore.RED)
 
 
+async def place_single_order(ctx, goods, preview=0, timeout=20):
+    """只发**一条** do-goods，不打开任何页面。返回 (code, msg, raw)。
+
+    实测（2026-11-12）：用 ctx.request.post 直接打 act-api，带 g_tk(skey) 算的
+    csrf 返回 200 正常业务码，不带则 400 CSRF-ERROR —— 说明请求完全走通，
+    服务端不校验 Referer/Origin，也就不需要为了一次试单去加载活动页。
+
+    这一点很重要：加载活动页会跑抢购那种量级的 JS，而且登录态有问题时还会
+    把 skey/uin/tinyid 清掉。试单只需要一个请求，不该付这些代价。
+    """
+    gtk = await csrf_from_context(ctx)
+    if not gtk:
+        return None, "context 里没有 skey，无法下单", {}
+    body = {
+        "activity_id": int(goods["activity_id"]),
+        "goods": [{
+            "act_id": int(goods["act_id"]),
+            "type": goods["type"],
+            "goods_param": goods.get("goods_param", {}),
+        }],
+        "agent_channel": {"fromChannel": "", "fromSales": "", "fromUrl": "",
+                          "isAgentClient": False},
+        "preview": int(preview),
+    }
+    try:
+        resp = await ctx.request.post(
+            sf.DO_GOODS_URL,
+            data=json.dumps(body),
+            headers={"Content-Type": "application/json", "x-csrf-token": gtk},
+            timeout=int(timeout * 1000),
+        )
+        r = await resp.json()
+    except Exception as e:
+        return None, f"请求失败: {str(e)[:100]}", {}
+    return r.get("code"), r.get("msg") or "", r
+
+
+# do-goods 的返回码怎么念给人听。只列实测见过的，其余显示原码让用户带原话反馈。
+GOODS_CODE_DESC = {
+    sf.CODE_OK: "下单成功（已建单）",
+    sf.CODE_NOT_STARTED: "秒杀尚未开始（这个商品受时间窗限制）",
+    sf.CODE_RATE_LIMIT: "访问频率过快：账号/IP 正在限流，减并发也没用，等 1~2 小时",
+    sf.CODE_BUSY: "系统繁忙：服务端在排队",
+    sf.CODE_SOLD_OUT: "本期已售罄",
+    sf.CODE_FACE_VERIFY: "账号需要人脸核身，去认证后才能买",
+    1100106: "检测到相同实名主体已购买该商品，不满足首单条件（这是资格问题，不是程序问题）",
+}
+
+
 async def test_once(region_id):
-    """测试下单流程：do-goods(preview=0) 真下单、不付款。用 109 元专区商品，不受场次时间窗限制。"""
+    """测试下单：用接口单发一条 do-goods，不加载页面、不跑抢购机器。
+
+    【为什么改成这样】
+    28de579 曾经把它改成 rapid_purchase(duration=3)，等于把整台抢购机器
+    （在途 30→64、每 15ms 回读）直接用来"测一下"。实测有人 3.7 秒打出 360 条
+    真下单请求、100% 是 408，账号被打进风控，之后真抢更难。
+    试单的目的只是"确认能不能走通、能不能建单"，一条请求足够。
+    """
     if not await ensure_login():
         return
     c("!" * 58, Fore.YELLOW)
-    c("  测试下单流程：用 109 元专区商品真下单（preview=0），不付款。", Fore.WHITE)
-    c("  这个商品和 38 元那款配置一样，但不是同一个商品。", Fore.WHITE)
+    c("  测试下单：用 109 元专区商品真下单（preview=0），不付款。", Fore.WHITE)
+    c("  **只发 1 条请求，不加载页面、不跑抢购那套并发**，不会因此被限流。", Fore.GREEN)
     c("  能确认：登录态、参数结构、首单资格、能不能建单。", Fore.WHITE)
     c("  不付款的订单 1 小时后自动关闭。抢之前去订单页取消掉。", Fore.YELLOW)
-    c("  别反复测：短时间多次建单会触发风控，有人被限制到第二天。", Fore.RED)
     c("!" * 58, Fore.YELLOW)
     try:
         # 大小写都认：曾有人输 yes 被当成取消，以为程序坏了（issue #14）
@@ -881,41 +999,70 @@ async def test_once(region_id):
 
     goods = {**sf.TEST_GOODS,
              "goods_param": {**sf.TEST_GOODS["goods_param"], "regionId": region_id}}
+    c(f"  测试商品: {goods['name']} act_id={goods['act_id']}", Fore.CYAN)
+    c(f"  地域: {REGIONS.get(region_id, region_id)}", Fore.CYAN)
+
     pw = None
     browser = None
     try:
         from playwright.async_api import async_playwright
         pw = await async_playwright().start()
         browser = await sf.launch_browser(pw, headless=True)
+        # 注意：只建 context，**不 new_page、不 goto**，所以没有任何页面和窗口
         ctx = await browser.new_context(storage_state=str(STATE_PATH), user_agent=UA)
-        await ctx.add_init_script(sf.CSRF_HOOK_JS)
-        page = await ctx.new_page()
-        page.set_default_timeout(30000)
-        sf.attach_csrf_sniffer(page)
-        await page.goto(sf.ACTIVITY_URL, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(3)
-        await _wait_csrf(page)
-        state, r = await _check_login(page)
+
+        # 先用接口确认登录态（不碰页面）
+        state, vr, _n = await verify_state(ctx)
         if state == "not-logged":
-            c(f"  登录态无效（{r.get('code') or r.get('__err')}），先扫码登录再试。", Fore.RED)
+            c(f"  登录态无效（{vr.get('code') or vr.get('__err')}），先扫码登录再试。", Fore.RED)
             return
         if state != "ok":
-            c(f"  登录态未能确认（{state}），继续尝试。", Fore.YELLOW)
-        price = await sf.fetch_price(page, goods["activity_id"], goods["act_id"],
-                                     goods["type"], region_id)
-        c(f"  测试商品: {goods['name']} act_id={goods['act_id']}", Fore.CYAN)
-        c(f"  价格: {sf.fmt_price(price)}", Fore.CYAN)
-        if price and price.get("real_cost") != sf.TEST_REAL_COST:
-            c(f"  注意：不是 109 元那款（实际 {sf.fmt_price(price)}），act_id 可能已变", Fore.RED)
-        c(f"  地域: {REGIONS.get(region_id, region_id)}", Fore.CYAN)
-        c("  开始测试下单（持续 3 秒）...", Fore.CYAN)
-        ok = await sf.rapid_purchase(page, goods, duration=3)
-        if ok:
-            c("  已建单 —— 请去控制台把这个订单取消掉，不要付款。", Fore.GREEN)
+            c(f"  登录态未能确认（{state}），继续尝试这一条。", Fore.YELLOW)
+
+        # 价格先查（只读接口，不产生任何写操作）
+        try:
+            gtk = await csrf_from_context(ctx)
+            pr = await ctx.request.post(
+                sf.API_BASE + "/dianshi/query-price",
+                data=json.dumps({
+                    "activity_id": int(goods["activity_id"]),
+                    "goods": [{"act_id": int(goods["act_id"]), "type": goods["type"],
+                               "goods_param": {**goods["goods_param"]}}],
+                    "preview": 0,
+                }),
+                headers={"Content-Type": "application/json", "x-csrf-token": gtk or ""},
+                timeout=15000,
+            )
+            pj = await pr.json()
+            items = (pj.get("data") if isinstance(pj.get("data"), list) else None) or []
+            price = next((x for x in items if int(x.get("act_id") or 0) == int(goods["act_id"])), None)
+            c(f"  价格: {sf.fmt_price(price)}", Fore.CYAN)
+            if price and price.get("real_cost") != sf.TEST_REAL_COST:
+                c(f"  注意：不是 109 元那款（实际 {sf.fmt_price(price)}），act_id 可能已变", Fore.RED)
+        except Exception as e:
+            c(f"  价格查询失败（不影响下单验证）: {str(e)[:60]}", Fore.YELLOW)
+
+        c("  发送 1 条下单请求…", Fore.CYAN)
+        code, msg, raw = await place_single_order(ctx, goods, preview=0)
+        if code is None:
+            c(f"  请求没发出去：{msg}", Fore.RED)
+            log(f"试单请求失败: {msg}")
+            return
+
+        desc = GOODS_CODE_DESC.get(code, "未识别的返回码，请把服务器原话发 issue")
+        if code == sf.CODE_OK:
+            c(f"  ★ 下单成功（code={code}）：{desc}", Fore.GREEN)
+            c("  请去控制台把这个订单取消掉，不要付款。", Fore.GREEN)
+            deal = (raw.get("data") or {})
+            if isinstance(deal, dict) and deal.get("deal_names"):
+                c(f"  订单号: {deal['deal_names'][0]}", Fore.GREEN)
         else:
-            c("  未成交，看上面日志里的返回码说明。", Fore.YELLOW)
+            c(f"  返回 code={code}：{desc}", Fore.YELLOW)
+            if msg:
+                c(f"  服务器原话: {msg}", Fore.WHITE)
+        log(f"试单（单发 1 条）: code={code} msg={str(msg)[:80]}")
     except Exception as e:
-        log(f"真下单异常: {str(e)[:120]}")
+        log(f"测试下单异常: {str(e)[:120]}")
         return
     finally:
         if browser:
